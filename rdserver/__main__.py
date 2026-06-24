@@ -176,14 +176,26 @@ def main() -> int:
     ssl_ctx = None
     scheme = "http"
     if args.tls:
-        if args.tls_cert and args.tls_key:
+        if args.tls_cert or args.tls_key:
+            # Real cert for a domain (e.g. rd.labxp.net) -> no browser warning.
+            if not (args.tls_cert and args.tls_key):
+                print("ERROR: --tls-cert and --tls-key must be given together.")
+                return 1
             cert_path, key_path = args.tls_cert, args.tls_key
+            print(f"TLS: using certificate {cert_path}")
         else:
             cert_path, key_path = _ensure_self_signed(ip)
             print(f"TLS: self-signed cert at {cert_path} "
                   f"(the browser warns once on first connect -- accept it).")
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_ctx.load_cert_chain(cert_path, key_path)
+        try:
+            ssl_ctx.load_cert_chain(cert_path, key_path)
+        except (ssl.SSLError, OSError) as e:
+            print(f"ERROR: could not load TLS cert/key ({e}).\n"
+                  f"  Check both paths exist and are READABLE by the service user. "
+                  f"Let's Encrypt's privkey.pem is root-only by default -- copy the "
+                  f"files somewhere you own (e.g. ~/.config/rdserver/).")
+            return 1
         scheme = "https"
 
     print("\n" + "=" * 64)

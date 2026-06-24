@@ -130,7 +130,9 @@ to `python3 -m rdserver` directly.
 |------|---------|
 | `--port N` | HTTP/signaling port (default 8089; the service uses 8098) |
 | `--token T` | fixed access token (default: random each start; `install.sh` pins one) |
-| `--tls` | serve HTTPS/WSS (self-signed cert auto-generated & cached, or `--tls-cert`/`--tls-key`) |
+| `--tls` | serve HTTPS/WSS. With no cert flags it auto-generates a self-signed cert |
+| `--tls-cert FILE` | use a real certificate (PEM, full chain) — see "Custom domain" below |
+| `--tls-key FILE` | matching private key (PEM); must be readable by the service user |
 | `--audio` | stream system audio (taps the default sink monitor, stereo 48 kHz) |
 | `--unattended` | uinput input + persistent capture (SSH-startable; see above) |
 | `--bitrate K` | initial video bitrate kbps (default 20000; also live in the toolbar) |
@@ -147,6 +149,37 @@ to `python3 -m rdserver` directly.
 > only on variable real networks.
 
 ---
+
+## Custom domain & trusted certificate (no browser warning)
+
+The default `--tls` uses a self-signed cert, so the browser warns once. To get rid of
+that, point a domain at the machine and feed in a real certificate with `--tls-cert` /
+`--tls-key`. Example for `rd.labxp.net`:
+
+1. **DNS:** make `rd.labxp.net` resolve to the PC (a Twingate-accessible address, or
+   your internal DNS).
+2. **Get a trusted cert.** If the host isn't publicly reachable on port 80/443 (e.g.
+   Twingate-only), use an **ACME DNS-01** challenge — it proves ownership via a DNS TXT
+   record, no inbound exposure:
+   ```bash
+   sudo certbot certonly --preferred-challenges dns -d rd.labxp.net
+   # (or acme.sh / your DNS provider's plugin)
+   ```
+3. **Make the files readable by your user** — the service runs as you, not root, and
+   Let's Encrypt's `privkey.pem` is root-only by default. Copy them somewhere you own
+   (and re-copy on renewal, e.g. via a certbot `--deploy-hook`):
+   ```bash
+   install -m 644 /etc/letsencrypt/live/rd.labxp.net/fullchain.pem ~/.config/rdserver/
+   install -m 600 /etc/letsencrypt/live/rd.labxp.net/privkey.pem   ~/.config/rdserver/
+   ```
+4. **Point the server at them** — edit `~/.config/rdserver/rd.env`:
+   ```
+   RD_OPTS="--port 8098 --tls --tls-cert /home/you/.config/rdserver/fullchain.pem --tls-key /home/you/.config/rdserver/privkey.pem --audio --unattended --token <yours>"
+   ```
+   then `./rd.sh start`. Connect via `https://rd.labxp.net:8098/?token=...` — no warning.
+
+Certs renew ~every 90 days; restart the service after each renewal (a certbot deploy
+hook that copies the files and runs `systemctl --user restart rdserver` automates it).
 
 ## Video codecs & browser compatibility
 
