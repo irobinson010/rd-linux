@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Runtime artifacts
+*.log
+rdserver.log
+
+# Opt-in debug SDP dumps (RD_DUMP_SDP=1)
+/tmp/rd-*.sdp
+
+# Editor / OS
+.DS_Store
+*.swp

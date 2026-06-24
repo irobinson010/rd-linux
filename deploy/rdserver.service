@@ -1,0 +1,38 @@
+# rdserver as a per-user systemd service.
+#
+# Why a *user* service: it needs your live graphical session (xdg-desktop-portal,
+# PipeWire, kscreen), so it must start at graphical login -- not before. In
+# --unattended mode you approve the KDE screen-share dialog ONCE; the grant is
+# remembered and restarts (including over SSH) restore the capture silently.
+#
+# Easiest install: run ./install.sh -- it sets WorkingDirectory to your checkout and
+# generates a stable, random access token for you. Manual install:
+#   cp deploy/rdserver.service ~/.config/systemd/user/
+#   # set WorkingDirectory below to your checkout, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now rdserver
+#   journalctl --user -u rdserver -e        # find the connect URL/token
+
+[Unit]
+Description=Wayland WebRTC remote desktop (rdserver)
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+# Portal/PipeWire may not be ready the instant we start at login; keep retrying
+# (Restart=on-failure) instead of systemd giving up after a few quick failures.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Path to your checkout (install.sh rewrites this to the real location).
+WorkingDirectory=%h/rd-linux
+# Default options. NOTE: there is deliberately no --token here -- without the env
+# file below the token is random each start. install.sh writes a stable, randomly
+# generated --token to ~/.config/rdserver/rd.env, which is loaded AFTER this line and
+# overrides RD_OPTS. The '-' makes the file optional (no failure if it's absent).
+Environment="RD_OPTS=--port 8098 --tls --audio --unattended"
+EnvironmentFile=-%h/.config/rdserver/rd.env
+ExecStart=/usr/bin/python3 -m rdserver $RD_OPTS
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

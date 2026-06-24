@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Wayland Remote Desktop</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="bar">
+    <span id="status">connecting…</span>
+    <span id="monitors"></span>
+    <span class="spacer"></span>
+    <select id="res" title="Streaming resolution">
+      <option value="1280x720">720p</option>
+      <option value="1920x1080">1080p</option>
+      <option value="2560x1440" selected>1440p</option>
+      <option value="3840x2160">2160p (4K)</option>
+    </select>
+    <select id="bitrate" title="Bitrate">
+      <option value="8000">8 Mbps</option>
+      <option value="20000" selected>20 Mbps</option>
+      <option value="40000">40 Mbps</option>
+      <option value="80000">80 Mbps</option>
+    </select>
+    <button id="control" disabled>Take control</button>
+    <button id="fill">Fill</button>
+    <button id="sound">🔇 Sound off</button>
+    <button id="zoomout" title="Zoom out">−</button>
+    <button id="zoomin" title="Zoom in">+</button>
+    <button id="zoomreset" title="Reset zoom">1:1</button>
+    <button id="fullscreen">Fullscreen</button>
+  </div>
+  <div id="stage">
+    <video id="screen" autoplay playsinline muted></video>
+    <div id="overlay" class="hidden">
+      <p id="overlay-text"></p>
+    </div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; height: 100%; background: #0b0b0d; color: #e6e6e6;
+  font: 14px/1.4 system-ui, sans-serif; overflow: hidden;
+}
+#bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; background: #17171b; border-bottom: 1px solid #2a2a30;
+  height: 44px;
+}
+#bar .spacer { flex: 1; }
+#monitors { display: flex; gap: 6px; }
+#monitors button { padding: 4px 10px; }
+#res, #bitrate {
+  background: #2a2a33; color: #e6e6e6; border: 1px solid #3a3a45;
+  border-radius: 6px; padding: 5px 8px; cursor: pointer;
+}
+#status { font-variant-numeric: tabular-nums; color: #b9b9c0; }
+#status.ok { color: #6fe08a; }
+#status.err { color: #ff6b6b; }
+button {
+  background: #2a2a33; color: #e6e6e6; border: 1px solid #3a3a45;
+  border-radius: 6px; padding: 6px 12px; cursor: pointer;
+}
+button:hover:not(:disabled) { background: #34343f; }
+button:disabled { opacity: .5; cursor: default; }
+button.active { background: #2f6f43; border-color: #3c8a55; }
+#stage {
+  position: relative; width: 100%; height: calc(100% - 44px);
+  background: #000; display: flex; align-items: center; justify-content: center;
+  overflow: hidden; touch-action: none;
+}
+#screen {
+  max-width: 100%; max-height: 100%; width: 100%; height: 100%;
+  object-fit: contain; display: block; outline: none;
+  transform-origin: 0 0;
+}
+#screen.fill { object-fit: cover; }
+#stage.controlling { cursor: none; }
+#overlay {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; background: rgba(0,0,0,.6); text-align: center;
+  padding: 24px;
+}
+#overlay.hidden { display: none; }
+#overlay p { max-width: 520px; }
