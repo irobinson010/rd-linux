@@ -9,8 +9,10 @@
 <body>
   <div id="bar">
     <span id="status">connecting…</span>
-    <span id="monitors"></span>
     <span class="spacer"></span>
+    <button id="menubtn" title="Menu" aria-label="Menu">☰</button>
+    <div id="controls">
+    <span id="monitors"></span>
     <select id="res" title="Streaming resolution">
       <option value="1280x720">720p</option>
       <option value="1920x1080">1080p</option>
@@ -29,10 +31,16 @@
     <button id="zoomout" title="Zoom out">−</button>
     <button id="zoomin" title="Zoom in">+</button>
     <button id="zoomreset" title="Reset zoom">1:1</button>
+    <button id="keyboard" title="On-screen keyboard (type from a phone)">⌨</button>
     <button id="fullscreen">Fullscreen</button>
+    </div>
   </div>
   <div id="stage">
     <video id="screen" autoplay playsinline muted></video>
+    <!-- Hidden field: focusing it pops the phone's soft keyboard so we can capture
+         typing and forward it. Must stay focusable (not display:none). -->
+    <input id="kbdinput" type="text" autocomplete="off" autocorrect="off"
+           autocapitalize="none" spellcheck="false" aria-hidden="true" tabindex="-1">
     <div id="overlay" class="hidden">
       <p id="overlay-text"></p>
     </div>

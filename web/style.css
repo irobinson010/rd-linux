@@ -4,18 +4,44 @@ html, body {
   font: 14px/1.4 system-ui, sans-serif; overflow: hidden;
 }
 #bar {
+  position: relative;
   display: flex; align-items: center; gap: 8px;
   padding: 6px 10px; background: #17171b; border-bottom: 1px solid #2a2a30;
   height: 44px;
 }
 #bar .spacer { flex: 1; }
 #monitors { display: flex; gap: 6px; }
+
+/* Controls are inline on wide screens; the ☰ button is hidden there. */
+#controls { display: flex; align-items: center; gap: 8px; }
+#menubtn { display: none; font-size: 18px; line-height: 1; }
+
+/* Narrow / phone: collapse the controls into a dropdown opened by ☰. */
+@media (max-width: 900px) {
+  #menubtn { display: inline-block; }
+  #controls {
+    display: none;
+    position: absolute; top: 44px; right: 0;
+    width: min(280px, 100vw);
+    flex-direction: column; align-items: stretch; gap: 8px; padding: 10px;
+    background: #17171b; border: 1px solid #2a2a30; border-top: none;
+    border-bottom-left-radius: 8px;
+    max-height: calc(100vh - 44px); overflow-y: auto; z-index: 30;
+  }
+  #controls.open { display: flex; }
+  #controls > * { width: 100%; }
+  #monitors { flex-direction: column; }
+  #monitors button { width: 100%; }
+}
 #monitors button { padding: 4px 10px; }
 #res, #bitrate {
   background: #2a2a33; color: #e6e6e6; border: 1px solid #3a3a45;
   border-radius: 6px; padding: 5px 8px; cursor: pointer;
 }
-#status { font-variant-numeric: tabular-nums; color: #b9b9c0; }
+#status {
+  font-variant-numeric: tabular-nums; color: #b9b9c0;
+  max-width: 50vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 #status.ok { color: #6fe08a; }
 #status.err { color: #ff6b6b; }
 button {
@@ -43,4 +69,11 @@ button.active { background: #2f6f43; border-color: #3c8a55; }
   padding: 24px;
 }
 #overlay.hidden { display: none; }
+/* Hidden keyboard catcher: invisible but focusable (display:none won't show the
+   soft keyboard). font-size 16px stops iOS zooming in on focus. */
+#kbdinput {
+  position: absolute; bottom: 0; left: 0; width: 1px; height: 1px;
+  opacity: 0; border: 0; padding: 0; margin: 0; font-size: 16px;
+  color: transparent; background: transparent; caret-color: transparent;
+}
 #overlay p { max-width: 520px; }

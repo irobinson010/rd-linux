@@ -1,6 +1,6 @@
 "use strict";
 
-console.log("rdclient build 20 loaded");
+console.log("rdclient build 22 loaded");
 
 const params = new URLSearchParams(location.search);
 const TOKEN = params.get("token") || "";
@@ -20,6 +20,10 @@ const bitrateSel = document.getElementById("bitrate");
 const zoomInBtn = document.getElementById("zoomin");
 const zoomOutBtn = document.getElementById("zoomout");
 const zoomResetBtn = document.getElementById("zoomreset");
+const keyboardBtn = document.getElementById("keyboard");
+const kbdInput = document.getElementById("kbdinput");
+const menuBtn = document.getElementById("menubtn");
+const controls = document.getElementById("controls");
 let fillMode = false;
 let zoom = 1, panX = 0, panY = 0;
 // Video mode the browser requests. Firefox and Chromium-on-Linux/NVIDIA often
@@ -479,6 +483,105 @@ window.addEventListener("mousemove", (e) => {
   panDrag = { x: e.clientX, y: e.clientY }; applyTransform();
 });
 window.addEventListener("mouseup", () => { panDrag = null; });
+
+// ---- on-screen / mobile keyboard ----------------------------------------
+// Phones won't show a soft keyboard for a <video>. The Keyboard button focuses a
+// hidden field; physical keyboards + named keys (Enter/Backspace/arrows) arrive via
+// keydown with a real .code, while mobile IME characters arrive via 'input' -- we
+// diff the field value and map each character to keystrokes (assumes a US host
+// layout, since the server injects physical keycodes).
+let kbdLast = "";
+const CHAR_MAP = (() => {
+  const m = {};
+  for (const c of "abcdefghijklmnopqrstuvwxyz") m[c] = ["Key" + c.toUpperCase(), false];
+  for (const c of "ABCDEFGHIJKLMNOPQRSTUVWXYZ") m[c] = ["Key" + c, true];
+  for (const c of "0123456789") m[c] = ["Digit" + c, false];
+  Object.assign(m, {
+    " ": ["Space", false], "\t": ["Tab", false], "\n": ["Enter", false],
+    "!": ["Digit1", true], "@": ["Digit2", true], "#": ["Digit3", true],
+    "$": ["Digit4", true], "%": ["Digit5", true], "^": ["Digit6", true],
+    "&": ["Digit7", true], "*": ["Digit8", true], "(": ["Digit9", true],
+    ")": ["Digit0", true],
+    "-": ["Minus", false], "_": ["Minus", true],
+    "=": ["Equal", false], "+": ["Equal", true],
+    "[": ["BracketLeft", false], "{": ["BracketLeft", true],
+    "]": ["BracketRight", false], "}": ["BracketRight", true],
+    "\\": ["Backslash", false], "|": ["Backslash", true],
+    ";": ["Semicolon", false], ":": ["Semicolon", true],
+    "'": ["Quote", false], '"': ["Quote", true],
+    ",": ["Comma", false], "<": ["Comma", true],
+    ".": ["Period", false], ">": ["Period", true],
+    "/": ["Slash", false], "?": ["Slash", true],
+    "`": ["Backquote", false], "~": ["Backquote", true],
+  });
+  return m;
+})();
+
+function tapKey(code, shift) {
+  if (shift) sendInput({ t: "key", code: "ShiftLeft", pressed: true });
+  sendInput({ t: "key", code, pressed: true });
+  sendInput({ t: "key", code, pressed: false });
+  if (shift) sendInput({ t: "key", code: "ShiftLeft", pressed: false });
+}
+function sendChar(ch) {
+  const m = CHAR_MAP[ch];
+  if (m) tapKey(m[0], m[1]);
+}
+
+// Physical/named keys forward directly. Skip IME composition (keyCode 229 / empty
+// code) -- those characters come through the 'input' handler below instead.
+kbdInput.addEventListener("keydown", (e) => {
+  if (e.isComposing || e.keyCode === 229 || !e.code) return;
+  e.preventDefault(); e.stopPropagation();
+  pressedKeys.add(e.code);
+  sendInput({ t: "key", code: e.code, pressed: true });
+});
+kbdInput.addEventListener("keyup", (e) => {
+  if (!e.code) return;
+  e.preventDefault(); e.stopPropagation();
+  pressedKeys.delete(e.code);
+  sendInput({ t: "key", code: e.code, pressed: false });
+});
+
+// Mobile characters: diff the field value vs last to find additions/deletions.
+kbdInput.addEventListener("input", () => {
+  const v = kbdInput.value;
+  let i = 0;
+  while (i < v.length && i < kbdLast.length && v[i] === kbdLast[i]) i++;
+  for (let k = kbdLast.length - i; k > 0; k--) tapKey("Backspace", false);
+  for (const ch of v.slice(i)) sendChar(ch);
+  kbdLast = v;
+  if (v.length > 500) { kbdInput.value = ""; kbdLast = ""; }   // don't grow forever
+});
+
+function toggleKeyboard() {
+  if (document.activeElement === kbdInput) {
+    kbdInput.blur();
+  } else {
+    kbdInput.value = ""; kbdLast = "";
+    kbdInput.focus();   // must run inside this click gesture to pop the soft keyboard
+    controls.classList.remove("open");   // close the menu so it doesn't cover the view
+  }
+}
+keyboardBtn.addEventListener("click", toggleKeyboard);
+kbdInput.addEventListener("focus", () => keyboardBtn.classList.add("active"));
+kbdInput.addEventListener("blur", () => {
+  keyboardBtn.classList.remove("active");
+  kbdInput.value = ""; kbdLast = "";
+});
+
+// ---- collapsing toolbar menu (narrow / phone screens) -------------------
+menuBtn.addEventListener("click", (e) => {
+  e.stopPropagation();           // don't let the outside-close handler fire on this
+  controls.classList.toggle("open");
+});
+document.addEventListener("click", (e) => {
+  if (controls.classList.contains("open")
+      && !controls.contains(e.target) && e.target !== menuBtn) {
+    controls.classList.remove("open");   // tap anywhere else closes it
+  }
+});
+
 fullscreenBtn.addEventListener("click", () => {
   if (!document.fullscreenElement) stage.requestFullscreen();
   else document.exitFullscreen();
