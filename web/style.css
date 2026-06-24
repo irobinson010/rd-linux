@@ -76,4 +76,18 @@ button.active { background: #2f6f43; border-color: #3c8a55; }
   opacity: 0; border: 0; padding: 0; margin: 0; font-size: 16px;
   color: transparent; background: transparent; caret-color: transparent;
 }
+#sharebox {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  background: #1c1c22; border: 1px solid #3a3a45; border-radius: 10px;
+  padding: 18px; width: min(520px, 92vw); z-index: 40;
+  box-shadow: 0 10px 40px rgba(0,0,0,.5);
+}
+#sharebox.hidden { display: none; }
+#sharebox p { margin: 0 0 10px; color: #d6d6dc; }
+#sharelink {
+  width: 100%; padding: 8px; border-radius: 6px;
+  background: #0e0e12; color: #e6e6e6; border: 1px solid #3a3a45;
+  font-family: monospace; font-size: 13px;
+}
+#sharebox .sharebtns { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
 #overlay p { max-width: 520px; }

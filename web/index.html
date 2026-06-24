@@ -26,6 +26,7 @@
       <option value="80000">80 Mbps</option>
     </select>
     <button id="control" disabled>Take control</button>
+    <button id="sharebtn" title="Create a view-only link to share">Share view</button>
     <button id="fill">Fill</button>
     <button id="sound">🔇 Sound off</button>
     <button id="zoomout" title="Zoom out">−</button>
@@ -43,6 +44,14 @@
            autocapitalize="none" spellcheck="false" aria-hidden="true" tabindex="-1">
     <div id="overlay" class="hidden">
       <p id="overlay-text"></p>
+    </div>
+    <div id="sharebox" class="hidden">
+      <p>View-only link — recipients can watch but not control:</p>
+      <input id="sharelink" type="text" readonly>
+      <div class="sharebtns">
+        <button id="sharecopy">Copy</button>
+        <button id="shareclose">Close</button>
+      </div>
     </div>
   </div>
   <script src="/app.js"></script>

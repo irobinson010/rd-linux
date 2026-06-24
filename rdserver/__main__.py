@@ -91,6 +91,12 @@ def main() -> int:
                          "/ the browser's pick.")
     ap.add_argument("--token", default=None,
                     help="access token (default: random, printed at startup)")
+    ap.add_argument("--view-token", default=None,
+                    help="optional SECOND token granting VIEW-ONLY access (video + "
+                         "audio, no mouse/keyboard) -- for screen-sharing to others")
+    ap.add_argument("--max-viewers", type=int, default=4,
+                    help="max simultaneous view-only sessions; each is its own "
+                         "encode, so keep it small (default 4)")
     ap.add_argument("--udp-ports", default="50000-50019",
                     help="WebRTC media UDP port range LO-HI (open these in the "
                          "firewall). Default 50000-50019")
@@ -169,7 +175,8 @@ def main() -> int:
                     force_software=args.software,
                     rtp_port_min=udp_lo, rtp_port_max=udp_hi,
                     audio=args.audio, codec="av1" if args.av1 else "h264",
-                    congestion_control=args.abr, injector=injector)
+                    congestion_control=args.abr, injector=injector,
+                    view_token=args.view_token, max_viewers=args.max_viewers)
 
     ip = primary_ip()
 
@@ -203,6 +210,9 @@ def main() -> int:
     print("(over Twingate, use this machine's Twingate address instead of the LAN IP):")
     print(f"\n    {scheme}://{ip}:{args.port}/?token={token}\n")
     print(f"token: {token}")
+    if args.view_token:
+        print("\nview-only URL (share to let others WATCH, no control):")
+        print(f"    {scheme}://{ip}:{args.port}/?token={args.view_token}")
     if not args.tls:
         print("note: signaling is plaintext -- add --tls for HTTPS/WSS so the "
               "token isn't exposed on the wire.")

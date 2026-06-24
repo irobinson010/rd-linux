@@ -121,6 +121,23 @@ Use the PC's Twingate address (or LAN IP locally) in the URL. If the browser's W
 
 ---
 
+## Screen-sharing (view-only links)
+
+Several people can connect at once: **one controller + a few view-only viewers**. A
+viewer gets the live video and audio but can't move the mouse or type — though they
+can still pick their own resolution/bitrate/screen/zoom.
+
+Two ways to hand out view-only access:
+
+- **From the control session**, click **"Share view"** — it mints a view-only token
+  and copies a ready-to-send link to your clipboard. Valid until the server restarts.
+- **A permanent link:** start with `--view-token <token>`; that URL always grants
+  view-only access.
+
+Each viewer is its own hardware encode, so keep the count modest (`--max-viewers`,
+default 4). Recipients must be able to reach the host (same Twingate/LAN), and the
+link carries a token — treat it like any other access link.
+
 ## Options
 
 Set these in `~/.config/rdserver/rd.env` (`RD_OPTS="..."`) for the service, or pass them
@@ -130,6 +147,8 @@ to `python3 -m rdserver` directly.
 |------|---------|
 | `--port N` | HTTP/signaling port (default 8089; the service uses 8098) |
 | `--token T` | fixed access token (default: random each start; `install.sh` pins one) |
+| `--view-token T` | second token for **view-only** access (watch, no control); also generatable in-app via "Share view" |
+| `--max-viewers N` | max simultaneous view-only sessions (each is its own encode; default 4) |
 | `--tls` | serve HTTPS/WSS. With no cert flags it auto-generates a self-signed cert |
 | `--tls-cert FILE` | use a real certificate (PEM, full chain) — see "Custom domain" below |
 | `--tls-key FILE` | matching private key (PEM); must be readable by the service user |

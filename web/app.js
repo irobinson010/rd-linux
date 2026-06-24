@@ -1,6 +1,6 @@
 "use strict";
 
-console.log("rdclient build 22 loaded");
+console.log("rdclient build 24 loaded");
 
 const params = new URLSearchParams(location.search);
 const TOKEN = params.get("token") || "";
@@ -24,6 +24,11 @@ const keyboardBtn = document.getElementById("keyboard");
 const kbdInput = document.getElementById("kbdinput");
 const menuBtn = document.getElementById("menubtn");
 const controls = document.getElementById("controls");
+const sharebtn = document.getElementById("sharebtn");
+const sharebox = document.getElementById("sharebox");
+const shareLink = document.getElementById("sharelink");
+const sharecopy = document.getElementById("sharecopy");
+const shareclose = document.getElementById("shareclose");
 let fillMode = false;
 let zoom = 1, panX = 0, panY = 0;
 // Video mode the browser requests. Firefox and Chromium-on-Linux/NVIDIA often
@@ -44,6 +49,7 @@ let pc = null;
 let ws = null;
 let inputChannel = null;     // datachannel created by the server ("input")
 let controlling = false;
+let canControl = true;       // set false by the server's "role" msg for view-only
 let statsTimer = null;
 let remoteStream = null;     // one stream holding the video + audio tracks
 let monitorList = [];        // [{index,width,height}, ...] from the server
@@ -124,6 +130,10 @@ function connect() {
       } catch (err) { console.warn("addIceCandidate", err); }
     } else if (msg.type === "monitors") {
       renderMonitors(msg.list, msg.active);
+    } else if (msg.type === "role") {
+      applyRole(msg.control);
+    } else if (msg.type === "view_link") {
+      showShare(location.origin + "/?token=" + encodeURIComponent(msg.token));
     } else if (msg.type === "error") {
       setStatus("server error: " + msg.message, "err");
       showOverlay("Server error: " + msg.message);
@@ -172,7 +182,7 @@ function newPeerConnection() {
     remoteStream.addTrack(e.track);
     video.play().catch((err) => console.warn("video.play() rejected:", err));
     setStatus("connected", "ok");
-    controlBtn.disabled = false;
+    controlBtn.disabled = !canControl;     // view-only sessions can't take control
     hideOverlay();
     startStats();
   };
@@ -353,11 +363,47 @@ function onKeyUp(e) {
   sendInput({ t: "key", code: e.code, pressed: false });
 }
 
+// The server tells us our role; view-only sessions lose the control + keyboard UI.
+function applyRole(control) {
+  canControl = control;
+  if (!control) {
+    setControlling(false);
+    controlBtn.textContent = "👁 View only";
+    controlBtn.disabled = true;
+    controlBtn.classList.remove("active");
+    keyboardBtn.style.display = "none";   // typing does nothing for a viewer
+    sharebtn.style.display = "none";      // viewers can't mint links
+  }
+}
+
+// ---- share a view-only link (control session only) ----------------------
+sharebtn.addEventListener("click", () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "make_view_link" }));
+  }
+});
+function showShare(url) {
+  shareLink.value = url;
+  sharebox.classList.remove("hidden");
+  shareLink.focus(); shareLink.select();
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(url)
+      .then(() => setStatus("view link copied to clipboard", "ok"), () => {});
+  }
+}
+sharecopy.addEventListener("click", () => {
+  shareLink.select();
+  if (navigator.clipboard) navigator.clipboard.writeText(shareLink.value);
+  else { try { document.execCommand("copy"); } catch (e) { /* */ } }
+});
+shareclose.addEventListener("click", () => sharebox.classList.add("hidden"));
+
 function setControlling(on) {
+  if (on && !canControl) return;          // view-only sessions can't control
   if (on === controlling) return;
   controlling = on;
   controlBtn.classList.toggle("active", on);
-  controlBtn.textContent = on ? "Release control (Esc·Esc)" : "Take control";
+  if (canControl) controlBtn.textContent = on ? "Release control (Esc·Esc)" : "Take control";
   stage.classList.toggle("controlling", on);
 
   if (on) {

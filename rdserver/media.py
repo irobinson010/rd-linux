@@ -159,6 +159,7 @@ class MediaSession:
                  max_width: int = 2560, max_height: int = 1440,
                  monitor_index: int = 0, audio: bool = False, vmode: str = "high",
                  congestion_control: bool = False, injector=None,
+                 allow_input: bool = True,
                  on_error: Callable[[str], None] | None = None):
         self.portal = portal
         self.send = send_cb
@@ -168,6 +169,9 @@ class MediaSession:
         # mirrors the portal's injection API, or the portal itself (default).
         # Capture always comes from the portal regardless.
         self.injector = injector if injector is not None else portal
+        # View-only sessions may tune their OWN stream (bitrate/monitor) but must
+        # never inject pointer/keyboard into the host.
+        self.allow_input = allow_input
 
         enc = "x264enc" if force_software else (encoder_available() or "x264enc")
         if not Gst.ElementFactory.find(enc):
@@ -525,6 +529,11 @@ class MediaSession:
     def _dispatch(self, ev: dict) -> None:
         t = ev.get("t")
         p = self.injector
+        # View-only: drop anything that would drive the host; allow per-session
+        # view tweaks (bitrate, monitor crop) through.
+        if not self.allow_input and t in ("move", "button", "wheel", "key",
+                                          "releaseall"):
+            return
         if t == "move":
             # Normalized [0,1] of the encoded frame -> cropped-region px -> absolute
             # px in the combined desktop frame (the single capture node).

@@ -45,10 +45,16 @@ class Server:
                  force_software: bool, rtp_port_min: int = 50000,
                  rtp_port_max: int = 50019, audio: bool = False,
                  codec: str = "h264", congestion_control: bool = False,
-                 injector=None):
+                 injector=None, view_token: str | None = None,
+                 max_viewers: int = 4):
         self.portal = portal          # single capture of the whole desktop
         self.codec = codec
         self.token = token
+        self.view_token = view_token   # optional static view-only token (--view-token)
+        # All currently-valid view-only tokens: the static one (if any) plus any
+        # generated on demand by a control session ("Share view" -> make_view_link).
+        self.view_tokens: set[str] = {view_token} if view_token else set()
+        self.max_viewers = max_viewers
         self.bitrate_kbps = bitrate_kbps
         self.force_software = force_software
         self.rtp_port_min = rtp_port_min
@@ -56,7 +62,10 @@ class Server:
         self.audio = audio
         self.congestion_control = congestion_control
         self.injector = injector       # uinput injector (unattended) or None=portal
-        self._current: MediaSession | None = None
+        # One controller (full input) + up to max_viewers view-only sessions. Each
+        # connection gets its own MediaSession/pipeline (WebRTC is point-to-point).
+        self._controller: MediaSession | None = None
+        self._viewers: list[MediaSession] = []
         self._auth_fail: dict[str, list] = {}   # ip -> [fail_count, window_start]
 
         self.app = web.Application()
@@ -83,37 +92,53 @@ class Server:
     async def _favicon(self, _request: web.Request) -> web.StreamResponse:
         return web.Response(status=204)
 
-    def _auth_ok(self, request: web.Request) -> bool:
-        """Constant-time token check with a per-IP failed-attempt throttle."""
+    def _role_for(self, request: web.Request) -> str | None:
+        """Constant-time token check with a per-IP failed-attempt throttle.
+        Returns 'control', 'view', or None (invalid / throttled)."""
         ip = request.remote or "?"
         now = time.monotonic()
         rec = self._auth_fail.get(ip)
         if rec and now - rec[1] < _AUTH_WINDOW_S and rec[0] >= _AUTH_MAX_FAILS:
             log.warning("auth throttled for %s", ip)
-            return False
+            return None
         token = request.query.get("token", "")
+        role = None
         if secrets.compare_digest(token, self.token):
+            role = "control"
+        elif token and any(secrets.compare_digest(token, vt)
+                           for vt in self.view_tokens):
+            role = "view"
+        if role is not None:
             self._auth_fail.pop(ip, None)
-            return True
+            return role
         if not rec or now - rec[1] >= _AUTH_WINDOW_S:
             self._auth_fail[ip] = [1, now]
         else:
             rec[0] += 1
-        return False
+        return None
 
     async def _ws(self, request: web.Request) -> web.StreamResponse:
-        if not self._auth_ok(request):
+        role = self._role_for(request)
+        if role is None:
             return web.Response(status=403, text="invalid or missing token")
 
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
         peer = request.remote
-        log.info("client connected: %s", peer)
+        log.info("client connected: %s (%s)", peer, role)
 
-        # Replace any existing controller.
-        if self._current is not None:
-            self._current.close()
-            self._current = None
+        if role == "control":
+            # One controller at a time: a new control connection replaces the old.
+            if self._controller is not None:
+                self._controller.close()
+                self._controller = None
+        else:  # view
+            if len(self._viewers) >= self.max_viewers:
+                await ws.send_str(json.dumps(
+                    {"type": "error",
+                     "message": f"viewer limit reached ({self.max_viewers})"}))
+                await ws.close()
+                return ws
 
         # Initial encode resolution chosen by the client (it reconnects to change
         # it, which is far more reliable than reconfiguring mid-stream).
@@ -152,14 +177,19 @@ class Server:
                 audio=self.audio, max_width=max_w, max_height=max_h,
                 monitor_index=monitor_index, vmode=vmode,
                 congestion_control=self.congestion_control,
-                injector=self.injector)
+                injector=self.injector, allow_input=(role == "control"))
         except Exception as e:
             log.exception("failed to start media session")
             await ws.send_str(json.dumps({"type": "error", "message": str(e)}))
             await ws.close()
             return ws
 
-        self._current = media
+        if role == "control":
+            self._controller = media
+        else:
+            self._viewers.append(media)
+        # Tell the client its role so it can show/hide the control UI.
+        send_cb({"type": "role", "control": role == "control"})
 
         try:
             async for msg in ws:
@@ -170,14 +200,21 @@ class Server:
                 except ValueError:
                     continue
                 kind = data.get("type")
-                log.info("ws recv from client: %s", kind)
                 if kind == "answer":
                     media.set_remote_answer(data["sdp"])
                 elif kind == "ice":
                     media.add_ice(data.get("sdpMLineIndex", 0), data["candidate"])
+                elif kind == "make_view_link" and role == "control":
+                    # Only a controller may mint a view-only token; valid until restart.
+                    t = secrets.token_urlsafe(16)
+                    self.view_tokens.add(t)
+                    log.info("control session generated a view-only token")
+                    send_cb({"type": "view_link", "token": t})
         finally:
-            log.info("client disconnected: %s", peer)
+            log.info("client disconnected: %s (%s)", peer, role)
             media.close()
-            if self._current is media:
-                self._current = None
+            if self._controller is media:
+                self._controller = None
+            elif media in self._viewers:
+                self._viewers.remove(media)
         return ws
