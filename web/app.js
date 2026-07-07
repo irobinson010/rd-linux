@@ -1,6 +1,6 @@
 "use strict";
 
-console.log("rdclient build 24 loaded");
+console.log("rdclient build 28 loaded");
 
 const params = new URLSearchParams(location.search);
 const TOKEN = params.get("token") || "";
@@ -443,7 +443,10 @@ window.addEventListener("keydown", (e) => {
   }
 }, true);
 
-controlBtn.addEventListener("click", () => setControlling(!controlling));
+controlBtn.addEventListener("click", () => {
+  setControlling(!controlling);
+  controls.classList.remove("open");   // close the menu so touch drives the remote
+});
 fillBtn.addEventListener("click", () => {
   fillMode = !fillMode;
   video.classList.toggle("fill", fillMode);
@@ -493,11 +496,13 @@ let pinchDist = 0, lastTouch = null;
 const touchDist = (t) =>
   Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
 stage.addEventListener("touchstart", (e) => {
+  if (controlling) return;            // controlling -> touch-to-control handles it
   if (e.touches.length === 2) pinchDist = touchDist(e.touches);
   else if (e.touches.length === 1 && !controlling && zoom > 1)
     lastTouch = { x: e.touches[0].clientX, y: e.touches[0].clientY };
 }, { passive: false });
 stage.addEventListener("touchmove", (e) => {
+  if (controlling) return;            // controlling -> touch-to-control handles it
   const sr = stage.getBoundingClientRect();
   if (e.touches.length === 2) {
     e.preventDefault();
@@ -517,6 +522,72 @@ stage.addEventListener("touchmove", (e) => {
   }
 }, { passive: false });
 stage.addEventListener("touchend", () => { pinchDist = 0; lastTouch = null; });
+
+// ---- touch-to-control: drive the cursor by touch while controlling -------
+// 1 finger: tap = left click, double-tap = double click, drag = move cursor.
+// 2 fingers: tap = right click, drag = scroll. (Pinch-zoom is for view mode.)
+let gMax = 0, gStart = null, gMoved = false;      // one touch gesture's state
+let gTwoY = 0, gTwoMoved = false, lastTap = 0;
+const TAP_MS = 300, TAP_SLOP = 12, SCROLL_STEP = 14;
+const midXY = (t) => ({ x: (t[0].clientX + t[1].clientX) / 2,
+                        y: (t[0].clientY + t[1].clientY) / 2 });
+
+stage.addEventListener("touchstart", (e) => {
+  if (!controlling) return;
+  e.preventDefault();
+  if (gMax === 0 && e.touches.length === 1) {     // first finger of a new gesture
+    const t = e.touches[0];
+    gStart = { x: t.clientX, y: t.clientY, time: performance.now() };
+    gMoved = false;
+    const p = normalizedPoint(t.clientX, t.clientY);
+    if (p) sendInput({ t: "move", x: p.x, y: p.y });   // cursor jumps to the finger
+  }
+  gMax = Math.max(gMax, e.touches.length);
+  if (e.touches.length === 2) {
+    const m = midXY(e.touches);
+    gTwoY = m.y; gTwoMoved = false;
+    const p = normalizedPoint(m.x, m.y);
+    if (p) sendInput({ t: "move", x: p.x, y: p.y });   // place cursor for right-click
+  }
+}, { passive: false });
+
+stage.addEventListener("touchmove", (e) => {
+  if (!controlling) return;
+  e.preventDefault();
+  if (e.touches.length === 1) {
+    const t = e.touches[0];
+    const p = normalizedPoint(t.clientX, t.clientY);
+    if (p) sendInput({ t: "move", x: p.x, y: p.y });   // cursor follows the finger
+    if (gStart && Math.hypot(t.clientX - gStart.x, t.clientY - gStart.y) > TAP_SLOP)
+      gMoved = true;
+  } else if (e.touches.length === 2) {
+    const y = midXY(e.touches).y;
+    if (Math.abs(y - gTwoY) >= SCROLL_STEP) {
+      sendInput({ t: "wheel", dx: 0, dy: y - gTwoY });  // (flip the sign if reversed)
+      gTwoY = y; gTwoMoved = true;
+    }
+  }
+}, { passive: false });
+
+stage.addEventListener("touchend", (e) => {
+  if (!controlling) return;
+  e.preventDefault();
+  if (e.touches.length > 0) return;        // wait until ALL fingers are lifted
+  const now = performance.now();
+  if (gMax === 1 && gStart && !gMoved && now - gStart.time < TAP_MS) {
+    sendInput({ t: "button", button: 0, pressed: true });   // tap -> left click
+    sendInput({ t: "button", button: 0, pressed: false });
+    if (now - lastTap < 350) {                              // double-tap -> dbl click
+      sendInput({ t: "button", button: 0, pressed: true });
+      sendInput({ t: "button", button: 0, pressed: false });
+    }
+    lastTap = now;
+  } else if (gMax === 2 && !gTwoMoved) {                    // 2-finger tap -> right click
+    sendInput({ t: "button", button: 2, pressed: true });
+    sendInput({ t: "button", button: 2, pressed: false });
+  }
+  gMax = 0; gStart = null; gMoved = false; gTwoMoved = false;
+}, { passive: false });
 
 // Mouse drag to pan when zoomed and not controlling (desktop).
 let panDrag = null;
@@ -574,30 +645,53 @@ function sendChar(ch) {
   if (m) tapKey(m[0], m[1]);
 }
 
+// TEMP on-screen keyboard-event debug (remove once Enter is sorted).
+const kbddbg = document.getElementById("kbddbg");
+let dbgLines = [];
+function dbg(s) {
+  dbgLines.unshift(s);
+  dbgLines = dbgLines.slice(0, 8);
+  kbddbg.textContent = dbgLines.join("\n");
+  kbddbg.classList.remove("hidden");
+}
+
 // Physical/named keys forward directly. Skip IME composition (keyCode 229 / empty
 // code) -- those characters come through the 'input' handler below instead.
 kbdInput.addEventListener("keydown", (e) => {
+  dbg("kd code=" + (e.code || "none") + " key=" + e.key + " kc=" + e.keyCode + " comp=" + e.isComposing);
   if (e.isComposing || e.keyCode === 229 || !e.code) return;
   e.preventDefault(); e.stopPropagation();
   pressedKeys.add(e.code);
   sendInput({ t: "key", code: e.code, pressed: true });
 });
 kbdInput.addEventListener("keyup", (e) => {
+  dbg("ku code=" + (e.code || "none") + " key=" + e.key);
   if (!e.code) return;
   e.preventDefault(); e.stopPropagation();
   pressedKeys.delete(e.code);
   sendInput({ t: "key", code: e.code, pressed: false });
 });
 
-// Mobile characters: diff the field value vs last to find additions/deletions.
-kbdInput.addEventListener("input", () => {
-  const v = kbdInput.value;
-  let i = 0;
-  while (i < v.length && i < kbdLast.length && v[i] === kbdLast[i]) i++;
-  for (let k = kbdLast.length - i; k > 0; k--) tapKey("Backspace", false);
-  for (const ch of v.slice(i)) sendChar(ch);
-  kbdLast = v;
-  if (v.length > 500) { kbdInput.value = ""; kbdLast = ""; }   // don't grow forever
+// Mobile soft keyboards: 'beforeinput' reports the intent (text, line break,
+// backspace) reliably even when keydown gives no .code and the return key inserts
+// no newline. We act on it and preventDefault so the hidden field stays empty.
+kbdInput.addEventListener("input", (e) =>
+  dbg("in it=" + e.inputType + " data=" + JSON.stringify(e.data)));
+kbdInput.addEventListener("beforeinput", (e) => {
+  dbg("bi it=" + e.inputType + " data=" + JSON.stringify(e.data));
+  const it = e.inputType;
+  if (it === "insertText" && e.data != null) {
+    for (const ch of e.data) sendChar(ch);
+  } else if (it === "insertLineBreak" || it === "insertParagraph") {
+    tapKey("Enter", false);
+  } else if (it === "deleteContentBackward") {
+    tapKey("Backspace", false);
+  } else if (it === "deleteContentForward") {
+    tapKey("Delete", false);
+  } else {
+    return;   // composition in progress / other -> leave it (no preventDefault)
+  }
+  e.preventDefault();
 });
 
 function toggleKeyboard() {
@@ -612,6 +706,7 @@ function toggleKeyboard() {
 keyboardBtn.addEventListener("click", toggleKeyboard);
 kbdInput.addEventListener("focus", () => keyboardBtn.classList.add("active"));
 kbdInput.addEventListener("blur", () => {
+  dbg("blur");
   keyboardBtn.classList.remove("active");
   kbdInput.value = ""; kbdLast = "";
 });
