@@ -32,6 +32,8 @@ LOG="$PROJECT_DIR/rdserver.log"
 RD_ENV="$HOME/.config/rdserver/rd.env"
 [ -f "$RD_ENV" ] && . "$RD_ENV"
 RD_OPTS="${RD_OPTS:---port 8098 --tls --audio --unattended}"
+# The token travels as an env var (never argv) -- export it for the direct run.
+[ -n "${RD_TOKEN:-}" ] && export RD_TOKEN
 
 have_service() { [ -f "$UNIT" ]; }
 
@@ -47,7 +49,10 @@ show_url() {  # pull the connect URL out of recent logs
 case "${1:-start}" in
   install)
     mkdir -p "$HOME/.config/systemd/user"
-    cp "$PROJECT_DIR/deploy/rdserver.service" "$UNIT"
+    # Same rewrite install.sh does: point the unit at THIS checkout. A verbatim
+    # copy ships WorkingDirectory=%h/rd-linux, which breaks any other location.
+    sed -E "s|^WorkingDirectory=.*|WorkingDirectory=$PROJECT_DIR|" \
+      "$PROJECT_DIR/deploy/rdserver.service" > "$UNIT"
     systemctl --user daemon-reload
     echo "installed/updated $UNIT"
     echo "start now: ./rd.sh start   |   auto-start at login: systemctl --user enable rdserver"

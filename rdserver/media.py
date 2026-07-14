@@ -20,6 +20,7 @@ import logging
 import os
 import subprocess
 import threading
+import time
 from typing import Callable
 
 import gi
@@ -252,6 +253,12 @@ class MediaSession:
                  len(self.monitors), desc)
         self.pipeline = Gst.parse_launch(desc)
         self.webrtc = self.pipeline.get_by_name("webrtc")
+        # NB: do NOT reach into webrtcbin's ICE agent to disable libnice UPnP
+        # (get_property("ice-agent").get_property("agent")). On this Python 3.14 +
+        # GStreamer 1.28 GI build that corrupts the ICE object's lifecycle, so the
+        # next negotiation SEGFAULTS (GST_IS_WEBRTC_ICE assertion -> core dump).
+        # The harmless "Error deleting port mapping: NoSuchEntryInArray" log lines
+        # are not worth crashing the server; leave the agent untouched.
         self.crop = self.pipeline.get_by_name("crop")
         self.outcaps = self.pipeline.get_by_name("outcaps")
         self.outcaps.set_property("caps", Gst.Caps.from_string(sized))
@@ -259,6 +266,7 @@ class MediaSession:
         # Diagnostic: if the audio queue fills and starts leaking, that's a concrete
         # choppy-audio cause (downstream backpressure) -- log it (throttled).
         self._aq_overruns = 0
+        self._aq_last_log = 0.0
         aq = self.pipeline.get_by_name("aqueue")
         if aq is not None:
             aq.connect("overrun", self._on_audio_overrun)
@@ -316,11 +324,28 @@ class MediaSession:
         self._announce_monitors()
 
     def _recrop_to_actual_frame(self) -> None:
+        # Right after (re)connect the first frame may not have arrived yet, so
+        # caps can be missing; without a retry the crop -- and the input mapping
+        # derived from it -- silently stays wrong until the next reconnect.
+        # Poll from a plain thread (same rules as __init__; never mutate
+        # videocrop from a streaming-thread pad probe).
+        if self._try_recrop():
+            return
+
+        def poll() -> None:
+            for _ in range(40):                          # up to ~10 s
+                time.sleep(0.25)
+                if self._closed or self._try_recrop():
+                    return
+            log.warning("no capture caps after 10s; crop assumes %dx%d",
+                        self.frame_w, self.frame_h)
+
+        threading.Thread(target=poll, name="recrop-poll", daemon=True).start()
+
+    def _try_recrop(self) -> bool:
         caps = self.crop.get_static_pad("sink").get_current_caps()
         if not caps:
-            log.warning("no capture caps yet; crop assumes %dx%d",
-                        self.frame_w, self.frame_h)
-            return
+            return False
         s = caps.get_structure(0)
         w, h = s.get_value("width"), s.get_value("height")
         log.info("ACTUAL capture frame %sx%s (portal reported %dx%d)",
@@ -328,6 +353,9 @@ class MediaSession:
         if w and h and (w, h) != (self.frame_w, self.frame_h):
             self.frame_w, self.frame_h = w, h
             self._apply_crop(self.active)
+            if hasattr(self.injector, "set_bounds"):
+                self.injector.set_bounds(self.frame_w, self.frame_h)
+        return True
 
     # ----- lifecycle -------------------------------------------------------
 
@@ -500,9 +528,12 @@ class MediaSession:
 
     def _on_audio_overrun(self, _queue) -> None:
         # Audio queue full -> it's leaking (dropping) audio. A real choppy-audio
-        # cause from downstream backpressure. Throttle so it can't spam the log.
+        # cause from downstream backpressure. Overruns arrive ~100/s during a
+        # stall, so throttle by TIME (one line per 10s), not by count.
         self._aq_overruns += 1
-        if self._aq_overruns <= 3 or self._aq_overruns % 50 == 0:
+        now = time.monotonic()
+        if self._aq_overruns <= 3 or now - self._aq_last_log >= 10.0:
+            self._aq_last_log = now
             log.warning("audio queue overrun #%d -- dropping audio (backpressure)",
                         self._aq_overruns)
 

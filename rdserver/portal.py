@@ -70,7 +70,9 @@ class Portal:
         self._cursor = cursor
         # capture_only: ScreenCast-only + persistence (input handled by uinput).
         # Lets the capture grant persist so restarts don't re-prompt (unattended).
-        self._capture_only = capture_only
+        # Public: signaling checks it to decide whether a dead session can be
+        # re-negotiated silently (restore token) or would pop a dialog.
+        self.capture_only = capture_only
 
         self.session_handle: str | None = None
         self.streams: list[dict] = []          # [{node_id, width, height}, ...]
@@ -135,7 +137,10 @@ class Portal:
     # ----- the negotiation handshake ---------------------------------------
 
     def negotiate(self) -> None:
-        if self._capture_only:
+        """Create + start the portal session. Re-callable: if the existing session
+        dies (PipeWire or xdg-desktop-portal restarted), calling this again builds
+        a fresh one -- silently in capture-only mode thanks to the restore token."""
+        if self.capture_only:
             self._negotiate_capture_only()
         else:
             self._negotiate_with_input()

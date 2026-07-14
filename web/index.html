@@ -26,6 +26,7 @@
       <option value="80000">80 Mbps</option>
     </select>
     <button id="control" disabled>Take control</button>
+    <button id="clipbtn" title="Shared clipboard" style="display:none">📋 Clipboard</button>
     <button id="sharebtn" title="Create a view-only link to share">Share view</button>
     <button id="fill">Fill</button>
     <button id="sound">🔇 Sound off</button>
@@ -48,11 +49,37 @@
     </div>
     <div id="kbddbg" class="hidden"></div>
     <div id="sharebox" class="hidden">
-      <p>View-only link — recipients can watch but not control:</p>
+      <p id="sharemsg">View-only link — recipients can watch but not control:</p>
       <input id="sharelink" type="text" readonly>
       <div class="sharebtns">
         <button id="sharecopy">Copy</button>
+        <button id="sharerevoke"
+                title="Invalidate every minted view link and disconnect its viewers">
+          Revoke all links</button>
         <button id="shareclose">Close</button>
+      </div>
+    </div>
+    <!-- Shared clipboard panel. Text here stays in sync with the remote PC's
+         clipboard; also a universal fallback where the browser blocks silent
+         clipboard access (Firefox/Safari) -- paste in and hit "Send to remote". -->
+    <div id="clipbox" class="hidden">
+      <p>Shared clipboard — stays in sync with the remote PC.</p>
+      <textarea id="cliptext" rows="4" spellcheck="false"
+                placeholder="Paste here, then Send to remote…"></textarea>
+      <div class="sharebtns">
+        <button id="clipsend">Send to remote</button>
+        <button id="clipclose">Close</button>
+      </div>
+    </div>
+    <!-- Token entry: shown when no token is stored (first visit without a
+         ?token= link) or when the stored one is rejected. Typing it here keeps
+         the secret out of the address bar / browser history entirely. -->
+    <div id="tokenbox" class="hidden">
+      <p id="tokenmsg">Enter the access token for this machine:</p>
+      <input id="tokeninput" type="password" autocomplete="off"
+             placeholder="access token">
+      <div class="sharebtns">
+        <button id="tokengo">Connect</button>
       </div>
     </div>
   </div>

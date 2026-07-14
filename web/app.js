@@ -1,9 +1,29 @@
 "use strict";
 
-console.log("rdclient build 28 loaded");
+console.log("rdclient build 29 loaded");
 
 const params = new URLSearchParams(location.search);
-const TOKEN = params.get("token") || "";
+// The token arrives once via ?token=… then lives in localStorage; scrub it from
+// the address bar immediately so it never sits in history / bookmarks / synced
+// tabs / screenshots. (It still rides the ws URL query, which is never displayed,
+// and the server's access log records paths only.) No token anywhere -> the
+// token prompt below lets you type it in, so a device can be bootstrapped
+// without the secret ever touching a URL.
+let TOKEN = "";
+try {
+  const urlToken = params.get("token");
+  if (urlToken) {
+    TOKEN = urlToken;
+    localStorage.setItem("rdtoken", urlToken);
+    params.delete("token");
+    const qs = params.toString();
+    history.replaceState(null, "", location.pathname + (qs ? "?" + qs : ""));
+  } else {
+    TOKEN = localStorage.getItem("rdtoken") || "";
+  }
+} catch (e) {   // storage blocked (strict privacy mode) -> old URL behaviour
+  TOKEN = params.get("token") || "";
+}
 
 const statusEl = document.getElementById("status");
 const controlBtn = document.getElementById("control");
@@ -27,8 +47,19 @@ const controls = document.getElementById("controls");
 const sharebtn = document.getElementById("sharebtn");
 const sharebox = document.getElementById("sharebox");
 const shareLink = document.getElementById("sharelink");
+const shareMsg = document.getElementById("sharemsg");
 const sharecopy = document.getElementById("sharecopy");
+const sharerevoke = document.getElementById("sharerevoke");
 const shareclose = document.getElementById("shareclose");
+const clipbtn = document.getElementById("clipbtn");
+const clipbox = document.getElementById("clipbox");
+const clipText = document.getElementById("cliptext");
+const clipsend = document.getElementById("clipsend");
+const clipclose = document.getElementById("clipclose");
+const tokenbox = document.getElementById("tokenbox");
+const tokenMsg = document.getElementById("tokenmsg");
+const tokenInput = document.getElementById("tokeninput");
+const tokengo = document.getElementById("tokengo");
 let fillMode = false;
 let zoom = 1, panX = 0, panY = 0;
 // Video mode the browser requests. Firefox and Chromium-on-Linux/NVIDIA often
@@ -56,6 +87,8 @@ let monitorList = [];        // [{index,width,height}, ...] from the server
 let activeMonitor = 0;
 const pressedKeys = new Set();     // codes sent down but not yet up
 const pressedButtons = new Set();
+let clipboardEnabled = false;      // server advertises it in the "role" message
+let lastClip = "";                 // last text synced EITHER way (echo guard)
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
@@ -110,11 +143,23 @@ function connect() {
     + `${encodeURIComponent(TOKEN)}&w=${w}&h=${h}&monitor=${activeMonitor}`
     + `&vmode=${vmode}`);
 
-  ws.onopen = () => setStatus("signaling connected, negotiating…");
-  ws.onclose = () => {
+  let opened = false;   // did the upgrade succeed? (a 403 closes before onopen)
+  ws.onopen = () => { opened = true; setStatus("signaling connected, negotiating…"); };
+  ws.onclose = (e) => {
     if (reconnecting) return;            // deliberate reconnect, not a drop
-    setStatus("disconnected", "err");
     teardown();
+    if (e.code === 4001) {               // controller revoked view access
+      setStatus("view access revoked", "err");
+      showOverlay("The controller revoked view access.");
+    } else if (!opened) {
+      // Rejected before the upgrade: bad/expired token (or server unreachable).
+      // Re-prompt rather than dead-ending -- the stored token may be stale.
+      setStatus("not authorized", "err");
+      showTokenPrompt("Couldn't connect: the access token was rejected (or the " +
+        "server is unreachable). Enter the current token to try again.");
+    } else {
+      setStatus("disconnected", "err");
+    }
   };
   ws.onerror = () => setStatus("signaling error", "err");
   ws.onmessage = async (e) => {
@@ -132,8 +177,17 @@ function connect() {
       renderMonitors(msg.list, msg.active);
     } else if (msg.type === "role") {
       applyRole(msg.control);
+      clipboardEnabled = !!msg.clipboard;
+      updateClipUI();
+    } else if (msg.type === "clipboard") {
+      onRemoteClipboard(msg.text);
     } else if (msg.type === "view_link") {
-      showShare(location.origin + "/?token=" + encodeURIComponent(msg.token));
+      showShare(location.origin + "/?token=" + encodeURIComponent(msg.token),
+        msg.ttl_s);
+    } else if (msg.type === "view_revoked") {
+      sharebox.classList.add("hidden");
+      setStatus("revoked " + msg.tokens + " view link(s), disconnected "
+        + msg.viewers + " viewer(s)", "ok");
     } else if (msg.type === "error") {
       setStatus("server error: " + msg.message, "err");
       showOverlay("Server error: " + msg.message);
@@ -265,6 +319,61 @@ function sendInput(obj) {
   }
 }
 
+// Signaling-channel send (offer/answer/ice go over the same socket). Used for
+// control messages that aren't input events -- e.g. clipboard sync.
+function wsSend(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+// ---- shared clipboard ----------------------------------------------------
+// Controller-only. Two directions, both echo-guarded by `lastClip`:
+//   remote -> local: server pushes {clipboard,text}; we write it to the local
+//                    clipboard (best-effort) and show it in the panel.
+//   local -> remote: on focus / take-control / panel we read the local clipboard
+//                    and send it, so a subsequent Ctrl+V in the remote pastes it.
+// Reading the local clipboard silently needs permission (Chrome/Edge grant it on
+// a gesture); where it's blocked, the panel textarea is the universal fallback.
+function updateClipUI() {
+  clipbtn.style.display = (clipboardEnabled && canControl) ? "" : "none";
+}
+
+function onRemoteClipboard(text) {
+  if (typeof text !== "string") return;
+  lastClip = text;
+  clipText.value = text;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(() => { /* panel still shows it */ });
+  }
+}
+
+function pushLocalClipboard() {
+  if (!clipboardEnabled || !canControl) return;
+  if (!navigator.clipboard || !navigator.clipboard.readText) return;
+  navigator.clipboard.readText().then((t) => {
+    if (t && t !== lastClip) {
+      lastClip = t;
+      clipText.value = t;
+      wsSend({ type: "clipboard", text: t });
+    }
+  }).catch(() => { /* blocked/denied -> use the panel's Send to remote */ });
+}
+
+clipbtn.addEventListener("click", () => {
+  clipbox.classList.remove("hidden");
+  controls.classList.remove("open");
+  pushLocalClipboard();            // opportunistically pull the local clipboard
+  clipText.focus();
+});
+clipsend.addEventListener("click", () => {
+  lastClip = clipText.value;
+  wsSend({ type: "clipboard", text: clipText.value });
+  clipbox.classList.add("hidden");
+  setStatus("clipboard sent to remote", "ok");
+});
+clipclose.addEventListener("click", () => clipbox.classList.add("hidden"));
+// When the tab regains focus the user may have just copied something locally.
+window.addEventListener("focus", pushLocalClipboard);
+
 // Toolbar buttons to switch which monitor is streamed (live server-side crop of
 // the one desktop capture -- instant, no reconnect).
 function renderMonitors(list, active) {
@@ -373,6 +482,7 @@ function applyRole(control) {
     controlBtn.classList.remove("active");
     keyboardBtn.style.display = "none";   // typing does nothing for a viewer
     sharebtn.style.display = "none";      // viewers can't mint links
+    clipbtn.style.display = "none";       // clipboard is controller-only
   }
 }
 
@@ -382,7 +492,10 @@ sharebtn.addEventListener("click", () => {
     ws.send(JSON.stringify({ type: "make_view_link" }));
   }
 });
-function showShare(url) {
+function showShare(url, ttlS) {
+  shareMsg.textContent = "View-only link — recipients can watch but not control. "
+    + (ttlS ? "Expires in ~" + Math.round(ttlS / 3600) + " h."
+            : "Valid until the server restarts.");
   shareLink.value = url;
   sharebox.classList.remove("hidden");
   shareLink.focus(); shareLink.select();
@@ -395,6 +508,11 @@ sharecopy.addEventListener("click", () => {
   shareLink.select();
   if (navigator.clipboard) navigator.clipboard.writeText(shareLink.value);
   else { try { document.execCommand("copy"); } catch (e) { /* */ } }
+});
+sharerevoke.addEventListener("click", () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "revoke_view_links" }));
+  }
 });
 shareclose.addEventListener("click", () => sharebox.classList.add("hidden"));
 
@@ -415,6 +533,7 @@ function setControlling(on) {
     window.addEventListener("keydown", onKeyDown, true);
     window.addEventListener("keyup", onKeyUp, true);
     requestAnimationFrame(flushMove);
+    pushLocalClipboard();        // sync local clipboard in so Ctrl+V works now
   } else {
     releaseAllInput();           // never leave a key/button stuck down
     video.removeEventListener("mousemove", onMouseMove);
@@ -751,12 +870,37 @@ document.addEventListener("fullscreenchange", () => {
   }
 });
 
+// ---- token prompt ---------------------------------------------------------
+// Shown when no token is known (fresh device, no ?token= link) or the stored
+// one was rejected. Lets you bootstrap by typing the token instead of pasting
+// a secret-bearing URL.
+function showTokenPrompt(msg) {
+  hideOverlay();
+  tokenMsg.textContent = msg;
+  tokenbox.classList.remove("hidden");
+  tokenInput.value = "";
+  tokenInput.focus();
+}
+function submitToken() {
+  const t = tokenInput.value.trim();
+  if (!t) return;
+  TOKEN = t;
+  try { localStorage.setItem("rdtoken", t); } catch (e) { /* */ }
+  tokenbox.classList.add("hidden");
+  showOverlay("Connecting…");
+  connect();
+}
+tokengo.addEventListener("click", submitToken);
+tokenInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") submitToken();
+});
+
 // ---- start ---------------------------------------------------------------
 
 if (!TOKEN) {
-  setStatus("missing ?token= in URL", "err");
-  showOverlay("This URL is missing its access token. Use the full link printed " +
-    "by the server (http://…/?token=…).");
+  setStatus("no access token", "err");
+  showTokenPrompt("Enter this machine's access token (printed by the server at "
+    + "startup; stored in ~/.config/rdserver/rd.env).");
 } else {
   showOverlay("Connecting…");
   connect();

@@ -130,13 +130,34 @@ can still pick their own resolution/bitrate/screen/zoom.
 Two ways to hand out view-only access:
 
 - **From the control session**, click **"Share view"** — it mints a view-only token
-  and copies a ready-to-send link to your clipboard. Valid until the server restarts.
+  and copies a ready-to-send link to your clipboard. Minted links **expire after
+  12 hours** (tune with `--view-ttl`), and the **"Revoke all links"** button in the
+  share dialog kills every minted link immediately and disconnects its viewers.
 - **A permanent link:** start with `--view-token <token>`; that URL always grants
-  view-only access.
+  view-only access (never expires, unaffected by revoke).
 
 Each viewer is its own hardware encode, so keep the count modest (`--max-viewers`,
 default 4). Recipients must be able to reach the host (same Twingate/LAN), and the
 link carries a token — treat it like any other access link.
+
+## Shared clipboard
+
+The **controller** shares a clipboard with the remote PC (viewers don't — it's not
+their machine). Needs `wl-clipboard` on the host (`install.sh` pulls it in); without
+it the feature quietly disables and the 📋 button doesn't appear.
+
+- **Copy on the remote → paste on your device:** copying anything on the remote PC
+  pushes it to your local clipboard automatically.
+- **Copy on your device → paste on the remote:** when you focus the tab or click
+  **Take control**, your local clipboard is sent over, so a `Ctrl+V` on the remote
+  pastes it.
+- **📋 Clipboard button:** opens a panel showing the synced text. It's also the
+  fallback on browsers that block silent clipboard access (Firefox/Safari) — paste
+  into it and hit **Send to remote**.
+
+Silent sync uses the browser Clipboard API, which needs a one-time permission grant
+(Chrome/Edge prompt on first use) and a secure context — so run with `--tls`. Text
+only, capped at 256 KB; images and files aren't synced.
 
 ## Options
 
@@ -146,9 +167,10 @@ to `python3 -m rdserver` directly.
 | flag | meaning |
 |------|---------|
 | `--port N` | HTTP/signaling port (default 8089; the service uses 8098) |
-| `--token T` | fixed access token (default: random each start; `install.sh` pins one) |
+| `--token T` | fixed access token (default: random each start; `install.sh` pins one via the `RD_TOKEN` env var — preferred over the flag, which is visible in `ps`) |
 | `--view-token T` | second token for **view-only** access (watch, no control); also generatable in-app via "Share view" |
 | `--max-viewers N` | max simultaneous view-only sessions (each is its own encode; default 4) |
+| `--view-ttl H` | lifetime (hours) of view links minted via "Share view" (default 12; 0 = until restart) |
 | `--tls` | serve HTTPS/WSS. With no cert flags it auto-generates a self-signed cert |
 | `--tls-cert FILE` | use a real certificate (PEM, full chain) — see "Custom domain" below |
 | `--tls-key FILE` | matching private key (PEM); must be readable by the service user |
@@ -220,8 +242,14 @@ heavy. To re-test a sharper codec on a device that fell back, clear that site's 
 ## Security notes
 
 - **Access = the token** (and your overlay/VPN). It's randomly generated at install,
-  stored in `~/.config/rdserver/rd.env` (mode 600), and never committed. Anyone with the
+  stored in `~/.config/rdserver/rd.env` (mode 600) as `RD_TOKEN`, and never committed.
+  It travels to the server as an environment variable — not a `--token` argument — so
+  it isn't readable by other local processes via `ps`. Anyone with the
   URL can control the machine — don't share or paste it anywhere.
+- **The token doesn't linger in the URL.** On load, the client moves `?token=…` into
+  the browser's `localStorage` and scrubs it from the address bar, so it stays out of
+  history, bookmarks, and synced tabs. A device can also be bootstrapped without any
+  token URL: open the bare `https://host:8098/` and type the token into the prompt.
 - **TLS** (`--tls`) encrypts the signaling/token on the wire with a self-signed cert; the
   WebRTC media is always DTLS/SRTP-encrypted. Still, don't bind this to a public
   interface — keep it behind Twingate/VPN.
@@ -263,6 +291,11 @@ that can **decode** AV1 in hardware — software AV1 decode is usually too slow 
 - **Audio choppy** → make sure `--abr` is *off* (default).
 - **Service won't start / restart loop** → `./rd.sh log`. Over SSH, use `./rd.sh`
   (it sets the env) rather than calling `python3` or `systemctl` bare.
+- **Every connect fails with `Invalid session`** → PipeWire or xdg-desktop-portal
+  restarted underneath a running server, killing its capture session. In
+  `--unattended` mode the server now re-negotiates from the saved grant and retries
+  automatically on the next connect (one log line, no dialog); if you still see it
+  repeatedly, the saved grant itself was revoked — restart and re-approve once.
 - **Re-prompted for the share dialog** → the saved grant was revoked (KDE "stop sharing")
   or the session wasn't reachable; in `--unattended` it restores silently otherwise.
 

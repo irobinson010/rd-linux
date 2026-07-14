@@ -27,6 +27,7 @@ PKGS=(
   python3-aiohttp                    # HTTP + WebSocket signaling
   python3-evdev                      # virtual input device for --unattended mode
   pulseaudio-utils                   # pactl (find the default sink for --audio)
+  wl-clipboard                       # wl-copy/wl-paste for shared-clipboard sync
   openssl                            # self-signed TLS cert for --tls
 )
 echo "==> Installing system packages (sudo apt)..."
@@ -58,8 +59,12 @@ if [ -f "$ENV_FILE" ]; then
   echo "==> Keeping existing token in $ENV_FILE (delete it to regenerate)."
 else
   TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(16))')"
-  ( umask 077; printf 'RD_OPTS="--port 8098 --tls --audio --unattended --token %s"\n' \
-      "$TOKEN" > "$ENV_FILE" )
+  # RD_TOKEN is a separate variable (not part of RD_OPTS) so the secret never
+  # appears on the process command line (ps / systemctl status show argv).
+  ( umask 077; {
+      printf 'RD_OPTS="--port 8098 --tls --audio --unattended"\n'
+      printf 'RD_TOKEN=%s\n' "$TOKEN"
+    } > "$ENV_FILE" )
   chmod 600 "$ENV_FILE"
   echo
   echo "==> Generated a random access token -> $ENV_FILE (mode 600, not in the repo)."

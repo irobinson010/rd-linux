@@ -90,13 +90,20 @@ def main() -> int:
                          "(e.g. Twingate); when off, bitrate stays fixed at --bitrate "
                          "/ the browser's pick.")
     ap.add_argument("--token", default=None,
-                    help="access token (default: random, printed at startup)")
+                    help="access token. Prefer the RD_TOKEN environment variable: "
+                         "argv is world-readable via /proc, env vars are not "
+                         "(default: random, printed at startup)")
     ap.add_argument("--view-token", default=None,
                     help="optional SECOND token granting VIEW-ONLY access (video + "
-                         "audio, no mouse/keyboard) -- for screen-sharing to others")
+                         "audio, no mouse/keyboard) -- for screen-sharing to "
+                         "others. Env alternative: RD_VIEW_TOKEN")
     ap.add_argument("--max-viewers", type=int, default=4,
                     help="max simultaneous view-only sessions; each is its own "
                          "encode, so keep it small (default 4)")
+    ap.add_argument("--view-ttl", type=float, default=12.0, metavar="HOURS",
+                    help="lifetime of view-only links minted in the client via "
+                         "'Share view' (default 12 hours; 0 = until the server "
+                         "restarts). The static --view-token never expires")
     ap.add_argument("--udp-ports", default="50000-50019",
                     help="WebRTC media UDP port range LO-HI (open these in the "
                          "firewall). Default 50000-50019")
@@ -136,7 +143,11 @@ def main() -> int:
     print(f"encoder available: {enc}"
           + ("  (using x264 software, --software)" if args.software else ""))
 
-    token = args.token or secrets.token_urlsafe(16)
+    # Token precedence: flag > environment > random. RD_TOKEN (set via the mode-600
+    # rd.env the service loads) keeps the secret off the command line, where any
+    # local process could read it from /proc/<pid>/cmdline or `ps`.
+    token = args.token or os.environ.get("RD_TOKEN") or secrets.token_urlsafe(16)
+    view_token = args.view_token or os.environ.get("RD_VIEW_TOKEN") or None
 
     try:
         lo_s, hi_s = args.udp_ports.split("-", 1)
@@ -176,7 +187,8 @@ def main() -> int:
                     rtp_port_min=udp_lo, rtp_port_max=udp_hi,
                     audio=args.audio, codec="av1" if args.av1 else "h264",
                     congestion_control=args.abr, injector=injector,
-                    view_token=args.view_token, max_viewers=args.max_viewers)
+                    view_token=view_token, max_viewers=args.max_viewers,
+                    view_ttl_s=max(0, int(args.view_ttl * 3600)))
 
     ip = primary_ip()
 
@@ -210,9 +222,9 @@ def main() -> int:
     print("(over Twingate, use this machine's Twingate address instead of the LAN IP):")
     print(f"\n    {scheme}://{ip}:{args.port}/?token={token}\n")
     print(f"token: {token}")
-    if args.view_token:
+    if view_token:
         print("\nview-only URL (share to let others WATCH, no control):")
-        print(f"    {scheme}://{ip}:{args.port}/?token={args.view_token}")
+        print(f"    {scheme}://{ip}:{args.port}/?token={view_token}")
     if not args.tls:
         print("note: signaling is plaintext -- add --tls for HTTPS/WSS so the "
               "token isn't exposed on the wire.")
