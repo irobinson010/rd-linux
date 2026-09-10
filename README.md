@@ -359,6 +359,18 @@ heavy. To re-test a sharper codec on a device that fell back, clear that site's 
 
 ---
 
+## Tests
+
+```bash
+tests/run.sh            # the automatic tests
+python3 tests/test_vrr.py   # or run one standalone
+```
+
+`test_webrtc_offer` needs GStreamer + an H.264 encoder; the auth/API and
+sd_notify tests need `python3-aiohttp`. Tests self-skip when a dependency is
+missing. `tests/test_uinput_mouse.py` is **manual** (it moves the real cursor)
+and isn't in the runner.
+
 ## Uninstall
 
 ```bash
