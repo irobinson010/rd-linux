@@ -26,7 +26,7 @@
       <option value="80000">80 Mbps</option>
     </select>
     <button id="control" disabled>Take control</button>
-    <button id="clipbtn" title="Shared clipboard" style="display:none">📋 Clipboard</button>
+    <button id="clipbtn" title="Shared clipboard" hidden>📋 Clipboard</button>
     <button id="sharebtn" title="Create a view-only link to share">Share view</button>
     <button id="fill">Fill</button>
     <button id="sound">🔇 Sound off</button>
@@ -46,8 +46,8 @@
               tabindex="-1" rows="1"></textarea>
     <div id="overlay" class="hidden">
       <p id="overlay-text"></p>
+      <button id="overlay-btn" hidden></button>
     </div>
-    <div id="kbddbg" class="hidden"></div>
     <div id="sharebox" class="hidden">
       <p id="sharemsg">View-only link — recipients can watch but not control:</p>
       <input id="sharelink" type="text" readonly>

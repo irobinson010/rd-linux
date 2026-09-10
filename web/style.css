@@ -64,11 +64,12 @@ button.active { background: #2f6f43; border-color: #3c8a55; }
 #screen.fill { object-fit: cover; }
 #stage.controlling { cursor: none; }
 #overlay {
-  position: absolute; inset: 0; display: flex; align-items: center;
-  justify-content: center; background: rgba(0,0,0,.6); text-align: center;
-  padding: 24px;
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 12px;
+  background: rgba(0,0,0,.6); text-align: center; padding: 24px;
 }
 #overlay.hidden { display: none; }
+#overlay p { margin: 0; }
 /* Hidden keyboard catcher: invisible but focusable (display:none won't show the
    soft keyboard). font-size 16px stops iOS zooming in on focus. */
 #kbdinput {
@@ -76,13 +77,6 @@ button.active { background: #2f6f43; border-color: #3c8a55; }
   opacity: 0; border: 0; padding: 0; margin: 0; font-size: 16px;
   color: transparent; background: transparent; caret-color: transparent;
 }
-#kbddbg {
-  position: absolute; top: 4px; left: 4px; z-index: 50;
-  max-width: 96vw; padding: 6px 8px; border-radius: 6px;
-  background: rgba(0,0,0,.82); color: #7fffae;
-  font: 11px/1.35 monospace; white-space: pre; pointer-events: none;
-}
-#kbddbg.hidden { display: none; }
 #sharebox, #tokenbox, #clipbox {
   position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
   background: #1c1c22; border: 1px solid #3a3a45; border-radius: 10px;

@@ -7,7 +7,6 @@ time), then serves the WebRTC remote-desktop client.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import secrets
@@ -30,21 +29,10 @@ from gi.repository import Gst  # noqa: E402
 
 from aiohttp import web  # noqa: E402
 
+from rdserver import sdnotify  # noqa: E402
 from rdserver.media import encoder_available  # noqa: E402
 from rdserver.portal import Portal  # noqa: E402
 from rdserver.signaling import ScrubAccessLogger, Server  # noqa: E402
-
-
-def detect_monitor_count() -> int:
-    """Number of enabled outputs (so we know how many share dialogs to request)."""
-    try:
-        out = subprocess.run(["kscreen-doctor", "-j"],
-                             capture_output=True, text=True, timeout=3)
-        n = sum(1 for o in json.loads(out.stdout).get("outputs", [])
-                if o.get("enabled"))
-        return max(1, n)
-    except Exception:
-        return 1
 
 
 def primary_ip() -> str:
@@ -97,6 +85,11 @@ def main() -> int:
                     help="optional SECOND token granting VIEW-ONLY access (video + "
                          "audio, no mouse/keyboard) -- for screen-sharing to "
                          "others. Env alternative: RD_VIEW_TOKEN")
+    ap.add_argument("--public-host", default=None,
+                    help="hostname/IP to put in shareable links (the connect URL "
+                         "and the tray's view links). Default: this machine's "
+                         "primary IP. Set it to your Twingate name so links work "
+                         "remotely. Env alternative: RD_PUBLIC_HOST")
     ap.add_argument("--max-viewers", type=int, default=4,
                     help="max simultaneous view-only sessions; each is its own "
                          "encode, so keep it small (default 4)")
@@ -104,9 +97,26 @@ def main() -> int:
                     help="lifetime of view-only links minted in the client via "
                          "'Share view' (default 12 hours; 0 = until the server "
                          "restarts). The static --view-token never expires")
-    ap.add_argument("--udp-ports", default="50000-50019",
-                    help="WebRTC media UDP port range LO-HI (open these in the "
-                         "firewall). Default 50000-50019")
+    ap.add_argument("--capture-fps", type=int, default=60, metavar="N",
+                    help="max frames per second to request from the compositor's "
+                         "screencast (1-120, default 60; the stream itself is 60, "
+                         "so anything above that is timing headroom only). Every "
+                         "captured frame costs the compositor a full-desktop render "
+                         "+ download, so on a high-refresh monitor this is what keeps "
+                         "a remote viewer from disturbing a game")
+    ap.add_argument("--game-capture", choices=("auto", "off"), default="auto",
+                    help="auto (default): while an X11/Xwayland window (e.g. a "
+                         "Steam/Proton game) is fullscreen and active, capture "
+                         "that window straight from Xwayland instead of the "
+                         "desktop, so KWin's screencast idles and the game stops "
+                         "flickering; viewers see only the game until you leave "
+                         "it. Needs --unattended. 'off' always captures the desktop")
+    ap.add_argument("--keep-vrr", action="store_true",
+                    help="do NOT switch monitors' adaptive sync (VRR) off while "
+                         "someone is connected. By default it is set to 'never' "
+                         "for the duration of a session and restored afterwards: "
+                         "capture load gives a fullscreen game small frame-time "
+                         "hiccups that a VRR panel shows as black frames")
     ap.add_argument("--audio", action="store_true",
                     help="also stream system audio (taps the default sink's "
                          "monitor; does not affect local playback)")
@@ -149,13 +159,6 @@ def main() -> int:
     token = args.token or os.environ.get("RD_TOKEN") or secrets.token_urlsafe(16)
     view_token = args.view_token or os.environ.get("RD_VIEW_TOKEN") or None
 
-    try:
-        lo_s, hi_s = args.udp_ports.split("-", 1)
-        udp_lo, udp_hi = int(lo_s), int(hi_s)
-    except ValueError:
-        print(f"ERROR: --udp-ports must be LO-HI, got {args.udp_ports!r}")
-        return 1
-
     # Set up the uinput injector first (fail fast before bothering with a dialog).
     injector = None
     if args.unattended:
@@ -182,18 +185,36 @@ def main() -> int:
     portal.negotiate()
     print(f"  capturing desktop {portal.width}x{portal.height} (node {portal.node_id})")
 
+    # Base of shareable URLs: the host people actually reach (Twingate name via
+    # --public-host / RD_PUBLIC_HOST, else this machine's primary LAN IP).
+    ip = primary_ip()
+    public_host = args.public_host or os.environ.get("RD_PUBLIC_HOST") or ip
+    scheme = "https" if args.tls else "http"
+    base_url = f"{scheme}://{public_host}:{args.port}"
+
     server = Server(portal, token=token, bitrate_kbps=args.bitrate,
                     force_software=args.software,
-                    rtp_port_min=udp_lo, rtp_port_max=udp_hi,
                     audio=args.audio, codec="av1" if args.av1 else "h264",
                     congestion_control=args.abr, injector=injector,
                     view_token=view_token, max_viewers=args.max_viewers,
-                    view_ttl_s=max(0, int(args.view_ttl * 3600)))
-
-    ip = primary_ip()
+                    view_ttl_s=max(0, int(args.view_ttl * 3600)),
+                    capture_fps=max(1, min(120, args.capture_fps)),
+                    base_url=base_url)
+    # Under systemd (Type=notify): say READY once the app is serving, then keep
+    # the watchdog fed from the event loop so a hung loop gets restarted.
+    sdnotify.install(server.app)
+    # Game-window capture needs the uinput injector (input is mapped from the
+    # window back onto the desktop; the portal's own input path can't do that).
+    if args.game_capture == "auto" and args.unattended:
+        # A captured game closing its window raises BadWindow inside ximagesrc;
+        # libX11's default handler would exit(1) the whole server.
+        from rdserver import xerrors
+        xerrors.install()
+        server.enable_game_capture()
+    if not args.keep_vrr:
+        server.enable_vrr_guard()
 
     ssl_ctx = None
-    scheme = "http"
     if args.tls:
         if args.tls_cert or args.tls_key:
             # Real cert for a domain (e.g. rd.labxp.net) -> no browser warning.
@@ -207,6 +228,9 @@ def main() -> int:
             print(f"TLS: self-signed cert at {cert_path} "
                   f"(the browser warns once on first connect -- accept it).")
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # Pin the floor ourselves rather than inherit whatever the system
+        # OpenSSL config allows; every browser this serves speaks 1.2+.
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         try:
             ssl_ctx.load_cert_chain(cert_path, key_path)
         except (ssl.SSLError, OSError) as e:
@@ -215,25 +239,30 @@ def main() -> int:
                   f"Let's Encrypt's privkey.pem is root-only by default -- copy the "
                   f"files somewhere you own (e.g. ~/.config/rdserver/).")
             return 1
-        scheme = "https"
 
     print("\n" + "=" * 64)
     print("Remote desktop server ready. Open this in the laptop's browser")
     print("(over Twingate, use this machine's Twingate address instead of the LAN IP):")
-    print(f"\n    {scheme}://{ip}:{args.port}/?token={token}\n")
+    print(f"\n    {base_url}/?token={token}\n")
     print(f"token: {token}")
+    if public_host != ip:
+        print(f"(--public-host {public_host}; LAN IP is {ip})")
     if view_token:
         print("\nview-only URL (share to let others WATCH, no control):")
-        print(f"    {scheme}://{ip}:{args.port}/?token={view_token}")
+        print(f"    {base_url}/?token={view_token}")
     if not args.tls:
         print("note: signaling is plaintext -- add --tls for HTTPS/WSS so the "
               "token isn't exposed on the wire.")
-    print(f"firewall: open TCP {args.port}, and UDP 32768-60999 "
-          f"(WebRTC media uses ephemeral ports; pinning temporarily disabled)")
+    print(f"firewall: allow TCP {args.port} and inbound UDP to this host "
+          f"(WebRTC media uses ephemeral ports, typically 32768-60999)")
     print("=" * 64 + "\n")
 
+    # shutdown_timeout: how long a stop waits for live WebSocket handlers before
+    # cancelling them. The default (60 s) turned every restart into a half-minute
+    # outage while an idle phone session drained; the clients reconnect anyway.
     web.run_app(server.app, host=args.host, port=args.port, print=None,
-                ssl_context=ssl_ctx, access_log_class=ScrubAccessLogger)
+                ssl_context=ssl_ctx, access_log_class=ScrubAccessLogger,
+                shutdown_timeout=5.0)
     return 0
 
 

@@ -9,12 +9,14 @@ Resolution changes reconnect (client passes w/h). Monitor geometry comes from
 kscreen-doctor; the crop is computed against the *actual* captured frame size read
 at runtime, so it's robust to logical/physical pixel differences.
 
-    pipewiresrc(desktop) -> videoconvert -> videocrop -> videoscale -> NV12 ->
-    nvh264enc -> h264parse -> rtph264pay -> webrtcbin  (+ audio, + input channel)
+    pipewiresrc(desktop, BGRA) -> videocrop -> videoscale -> [framerate stamp] ->
+    nvh264enc (BGRA in, GPU convert) -> h264parse -> rtph264pay -> webrtcbin
+    (+ audio, + input channel). Software encoders get a threaded videoconvert.
 """
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -44,6 +46,18 @@ AXIS_HORIZONTAL = 1
 # Congestion-control floor: never let the GCC estimator starve the encoder below
 # this (bits/sec). The ceiling is the configured/selected bitrate.
 _GCC_MIN_BPS = 1_000_000
+
+# Highest bitrate a client may select (kbps). 200 Mbps is far beyond any
+# sensible remote-desktop stream, and well inside every encoder's range.
+_MAX_BITRATE_KBPS = 200_000
+
+# Upper bound for --capture-fps (frames/s requested from the compositor).
+_MAX_CAPTURE_FPS = 120
+
+# Threads for the software (CPU) video paths: convert, scale, VP8/x264. Enough
+# to keep 1440p60 realtime on a modern desktop CPU, few enough to leave a game
+# its cores. (n-threads=0 would take every core.)
+_SW_THREADS = 4
 
 
 def encoder_available() -> str:
@@ -112,11 +126,15 @@ def _even0(n: float) -> int:       # for crop offsets (>= 0)
 
 
 def _encoder_fragment(name: str, bitrate_kbps: int) -> str:
+    # The capture arrives as BGRA. NVENC takes BGRA directly and converts on the
+    # GPU; the software encoders need a CPU conversion first (threaded: it's
+    # the single most expensive step on the CPU path).
     if name == "nvh264enc":
         return (f"nvh264enc name=enc bitrate={bitrate_kbps} gop-size=30 "
                 f"rc-mode=cbr preset=low-latency-hq zerolatency=true")
-    return (f"x264enc name=enc tune=zerolatency speed-preset=ultrafast "
-            f"bitrate={bitrate_kbps} key-int-max=30")
+    return (f"videoconvert n-threads={_SW_THREADS} ! "
+            f"x264enc name=enc tune=zerolatency speed-preset=ultrafast "
+            f"threads={_SW_THREADS} bitrate={bitrate_kbps} key-int-max=30")
 
 
 def _video_chain(vmode: str, h264_enc: str, bitrate_kbps: int) -> tuple[str, str]:
@@ -140,7 +158,13 @@ def _video_chain(vmode: str, h264_enc: str, bitrate_kbps: int) -> tuple[str, str
             and Gst.ElementFactory.find("rtpvp8pay")):
         # No NVENC VP8 -> software encode. deadline=1/cpu-used=6 keeps it realtime;
         # target-bitrate is in bits/sec (note: not the kbps that NVENC uses).
-        frag = (f"videoconvert ! vp8enc name=enc deadline=1 cpu-used=6 "
+        # Threaded convert + encode: 47 -> 69 fps at 1440p on the 12-core host.
+        # Bounded thread counts on purpose: this is the heaviest thing the
+        # server does, and a fullscreen game on the same box must keep its
+        # cores (combined capture+VP8+audio load produced black frames on a
+        # VRR panel; each piece alone did not).
+        frag = (f"videoconvert n-threads={_SW_THREADS} ! vp8enc name=enc deadline=1 "
+                f"cpu-used=6 threads={_SW_THREADS} "
                 f"target-bitrate={bitrate_kbps * 1000} keyframe-max-dist=30 "
                 f"error-resilient=default ! rtpvp8pay pt=96 ! "
                 f"application/x-rtp,media=video,encoding-name=VP8,payload=96")
@@ -156,16 +180,21 @@ def _video_chain(vmode: str, h264_enc: str, bitrate_kbps: int) -> tuple[str, str
 class MediaSession:
     def __init__(self, portal: Portal, *, send_cb: Callable[[dict], None],
                  bitrate_kbps: int = 20000, force_software: bool = False,
-                 rtp_port_min: int = 50000, rtp_port_max: int = 50019,
                  max_width: int = 2560, max_height: int = 1440,
                  monitor_index: int = 0, audio: bool = False, vmode: str = "high",
                  congestion_control: bool = False, injector=None,
-                 allow_input: bool = True,
+                 allow_input: bool = True, capture_fps: int = 60,
+                 window: dict | None = None,
                  on_error: Callable[[str], None] | None = None):
         self.portal = portal
         self.send = send_cb
         self.on_error = on_error
         self._closed = False
+        # GStreamer handles, filled in by _build; pre-set so close() is safe to
+        # call from the constructor's failure path however early it fails.
+        self.pipeline = self.webrtc = self.crop = self.outcaps = None
+        self.encoder = self.channel = self._aq = self._gcc = None
+        self._pw_fd: int | None = None
         # Input backend: a drop-in injector (uinput, for unattended mode) that
         # mirrors the portal's injection API, or the portal itself (default).
         # Capture always comes from the portal regardless.
@@ -184,14 +213,30 @@ class MediaSession:
         log.info("video mode: %s", self.codec)
 
         self.combined_node = portal.node_id
-        self.frame_w = portal.width or max_width     # refined from real caps below
-        self.frame_h = portal.height or max_height
-        self.monitors = monitor_layout()
-        if not self.monitors:
-            self.monitors = [{"name": "screen", "x": 0, "y": 0,
-                              "w": self.frame_w, "h": self.frame_h}]
+        # Capture source. Default: the portal's whole-desktop PipeWire stream,
+        # cropped to one monitor. Alternative: ONE X11 window read straight out
+        # of Xwayland (see gamewatch.py) -- `window` = {xid, title, x, y, w, h}
+        # with the rect in LOGICAL desktop px, so input can be mapped back onto
+        # the desktop. In that mode the "monitor list" is just that window.
+        self.window = window
+        if window:
+            self.frame_w, self.frame_h = window["w"], window["h"]   # refined below
+            self.monitors = [{"name": window["title"], "x": 0, "y": 0,
+                              "w": window["w"], "h": window["h"]}]
+            monitor_index = 0
+        else:
+            self.frame_w = portal.width or max_width     # refined from real caps below
+            self.frame_h = portal.height or max_height
+            self.monitors = monitor_layout()
+            if not self.monitors:
+                self.monitors = [{"name": "screen", "x": 0, "y": 0,
+                                  "w": self.frame_w, "h": self.frame_h}]
         self.logical_w = max(m["x"] + m["w"] for m in self.monitors)
         self.logical_h = max(m["y"] + m["h"] for m in self.monitors)
+        # Frame px -> injector (desktop logical px): identity for the desktop
+        # capture; offset+scale for a window capture (set by _apply_crop).
+        self._map_off_x = self._map_off_y = 0.0
+        self._map_scale_x = self._map_scale_y = 1.0
         self.active = max(0, min(monitor_index, len(self.monitors) - 1))
         self.enc_w, self.enc_h = max_width, max_height
         # active-crop state (set by _apply_crop), used for input mapping:
@@ -201,15 +246,45 @@ class MediaSession:
         self._scale_m = 1.0
         self._off_x = self._off_y = 0.0
 
-        # Cap the framerate. Without a framerate cap, pipewiresrc negotiates a very
-        # high rate (observed 240fps), which makes NVENC stamp H.264 *level 6.0*
-        # (profile-level-id=42c03c) into the SDP. Browsers' WebRTC H.264 receiver
-        # refuses level 6.0 and answers `m=video 0` (rejected) -> black screen, even
-        # though capture/encode are fine. 60fps -> level 5.1, which browsers accept.
+        # The framerate the ENCODER is told. The capture is variable-rate (KWin
+        # reports 0/1 and sends frames on damage); a fixed 60/1 is stamped onto
+        # the caps by capssetter -- without touching buffers or timestamps -- so
+        # NVENC computes a sane H.264 level. (Unbounded, pipewiresrc's 240 fps
+        # once made it stamp level 6.0 into the SDP, which browsers reject with
+        # `m=video 0` -> black screen.) This replaces a videorate stage, which
+        # had to hold every frame until the next one arrived to decide how many
+        # copies to emit: a full capture interval of latency, and duplicate
+        # frames for the encoder whenever the capture ran below 60.
         self.fps = 60
-        sized = (f"video/x-raw,format=NV12,width={self.enc_w},"
-                 f"height={self.enc_h},pixel-aspect-ratio=1/1,framerate={self.fps}/1")
-        fd = portal.open_pipewire_fd()
+        # Encode size only. No format here: the BGRA capture goes into NVENC as
+        # is (it converts on the GPU); the software encoders add their own
+        # convert. Converting the whole 6088x1490 desktop on the CPU *before*
+        # cropping, as this used to, capped the chain at ~33 fps on one core.
+        sized = (f"video/x-raw,width={self.enc_w},height={self.enc_h},"
+                 f"pixel-aspect-ratio=1/1")
+        # What we ask the COMPOSITOR for. The cap above sits after videorate, so
+        # it only drops frames the compositor has already paid for: without a
+        # limit at the source, KWin negotiated its 240 Hz panel rate and rendered
+        # + downloaded the whole desktop (36 MB) up to 240 times a second per
+        # viewer -- enough to make a game on that panel flicker. max-framerate
+        # maps to PipeWire's maxFramerate, which KWin honours. Capturing above
+        # self.fps buys nothing for the viewer (videorate drops the extra) but is
+        # allowed up to _MAX_CAPTURE_FPS as timing headroom.
+        self.capture_fps = max(1, min(int(capture_fps), _MAX_CAPTURE_FPS))
+        fd = None if window else portal.open_pipewire_fd()
+        self._pw_fd: int | None = fd      # closed in close(); see there
+        try:
+            self._build(fd, sized, audio, bitrate_kbps, congestion_control)
+        except Exception:
+            # Don't leak the descriptor (or a half-built pipeline) when the
+            # constructor fails partway; the caller only sees the exception.
+            self.close()
+            raise
+
+    def _build(self, fd: int, sized: str, audio: bool, bitrate_kbps: int,
+               congestion_control: bool) -> None:
+        """Build + start the pipeline (split from __init__ so a failure partway
+        can release the PipeWire fd and whatever was built)."""
         # When audio is on, the PulseAudio device is the pipeline MASTER clock (set in
         # the audio branch below). The video source must then NOT provide a clock --
         # otherwise it wins the clock election and the audio, captured on a different
@@ -217,12 +292,28 @@ class MediaSession:
         # rate, so the audio queue fills and drops every buffer forever (the observed
         # constant "audio queue overrun"). videorate absorbs video against this clock.
         pw_clock = "provide-clock=false " if audio else ""
+        if self.window:
+            # One X11 window, read from Xwayland. Nothing here touches KWin's
+            # screencast, which is the whole point. The grab rate follows
+            # --capture-fps (capped at the stream rate): it is host load like
+            # the desktop capture is, and 30 while gaming halves everything
+            # downstream too.
+            src = (f"ximagesrc xid={self.window['xid']} use-damage=false "
+                   f"show-pointer={'true' if self.portal.cursor else 'false'} ! "
+                   f"video/x-raw,framerate={min(self.capture_fps, self.fps)}/1 ! ")
+        else:
+            src = (f"pipewiresrc fd={fd} path={self.combined_node} do-timestamp=true "
+                   f"{pw_clock}keepalive-time=1000 ! "
+                   f"video/x-raw,max-framerate={self.capture_fps}/1 ! ")
         parts = [
-            f"pipewiresrc fd={fd} path={self.combined_node} do-timestamp=true "
-            f"{pw_clock}keepalive-time=1000 ! queue leaky=downstream max-size-buffers=4 ! "
-            f"videoconvert ! videocrop name=crop ! "
-            f"videoscale add-borders=true ! videorate ! capsfilter name=outcaps ! "
-            f"{self.video_chain} ! "
+            src
+            # Two frames of slack, newest kept: more only adds latency.
+            + "queue name=srcq leaky=downstream max-size-buffers=2 ! "
+            # Crop FIRST (cheap), then scale only what's left, threaded.
+            + f"videocrop name=crop ! videoscale n-threads={_SW_THREADS} add-borders=true ! "
+            + "capsfilter name=outcaps ! "
+            + f'capssetter caps="video/x-raw,framerate={self.fps}/1" ! '
+            + f"{self.video_chain} ! "
             f"webrtcbin name=webrtc bundle-policy=max-bundle latency=0",
         ]
 
@@ -268,6 +359,7 @@ class MediaSession:
         self._aq_overruns = 0
         self._aq_last_log = 0.0
         aq = self.pipeline.get_by_name("aqueue")
+        self._aq = aq                    # kept so close() can disconnect us
         if aq is not None:
             aq.connect("overrun", self._on_audio_overrun)
         # Congestion control: the configured/selected bitrate is the CEILING; GCC
@@ -318,10 +410,20 @@ class MediaSession:
                      clk.get_name() if clk else "none",
                      type(clk).__name__ if clk else "-")
         self._recrop_to_actual_frame()
-        if hasattr(self.injector, "set_bounds"):
-            # tell the uinput injector the capture-frame size to normalise against
-            self.injector.set_bounds(self.frame_w, self.frame_h)
+        self._set_bounds()
         self._announce_monitors()
+
+    def _set_bounds(self) -> None:
+        """Tell the uinput injector the size of the space its absolute
+        coordinates live in: the desktop. For the desktop capture that is the
+        capture frame itself; for a window capture it is still the desktop (the
+        portal knows its size) -- the window maps INTO it (see _apply_crop)."""
+        if not hasattr(self.injector, "set_bounds"):
+            return
+        if self.window:
+            self.injector.set_bounds(self.portal.width, self.portal.height)
+        else:
+            self.injector.set_bounds(self.frame_w, self.frame_h)
 
     def _recrop_to_actual_frame(self) -> None:
         # Right after (re)connect the first frame may not have arrived yet, so
@@ -343,7 +445,10 @@ class MediaSession:
         threading.Thread(target=poll, name="recrop-poll", daemon=True).start()
 
     def _try_recrop(self) -> bool:
-        caps = self.crop.get_static_pad("sink").get_current_caps()
+        crop = self.crop
+        if crop is None:                 # closed underneath the poll thread
+            return True
+        caps = crop.get_static_pad("sink").get_current_caps()
         if not caps:
             return False
         s = caps.get_structure(0)
@@ -353,8 +458,7 @@ class MediaSession:
         if w and h and (w, h) != (self.frame_w, self.frame_h):
             self.frame_w, self.frame_h = w, h
             self._apply_crop(self.active)
-            if hasattr(self.injector, "set_bounds"):
-                self.injector.set_bounds(self.frame_w, self.frame_h)
+            self._set_bounds()
         return True
 
     # ----- lifecycle -------------------------------------------------------
@@ -367,10 +471,64 @@ class MediaSession:
             self._release_modifiers()
         except Exception:
             pass
+        # Take the GStreamer objects away from this instance, then stop and free
+        # them on a helper thread (see _teardown for why both halves matter).
+        objs = (self.pipeline, self.webrtc, self.channel, self._aq, self._gcc)
+        pw_fd, self._pw_fd = self._pw_fd, None
+        self.pipeline = self.webrtc = self.crop = self.outcaps = None
+        self.encoder = self.channel = self._aq = self._gcc = None
+        threading.Thread(target=self._teardown, args=(objs, pw_fd),
+                         name="gst-teardown", daemon=True).start()
+
+    def _teardown(self, objs: tuple, pw_fd: int | None) -> None:
+        """Stop and actually FREE a session's pipeline.
+
+        NULL state releases the encoder, but webrtcbin's ICE agent keeps its
+        sockets (dozens: every interface x UDP/TCP x component, plus eventfds
+        and pipes) until the element is *finalized*, i.e. until Python drops the
+        last reference. Our signal handlers are bound methods, so the pipeline
+        and the MediaSession sit in a reference cycle only the cyclic GC can
+        break -- and on a mostly idle server that can take hours. Meanwhile each
+        session leaked ~50 fds; at the user-service default of 1024 GLib could no
+        longer create a pipe and aborted the process with SIGTRAP (2026-09-08).
+
+        Freeing has a trap of its own: finalizing webrtcbin joins its worker
+        thread, and that thread may be mid-way through delivering a late
+        notify:: signal to one of our Python handlers, waiting for the GIL --
+        which the finalizing thread holds. So: disconnect our handlers first,
+        give in-flight emissions (and the bus-watch thread) a moment to drain,
+        and do all of it on this helper thread, so the pathological case could
+        only ever stall this thread, never the server."""
+        pipeline, webrtc, channel, aq, gcc = objs
         try:
-            self.pipeline.set_state(Gst.State.NULL)
+            if pipeline is not None:
+                pipeline.set_state(Gst.State.NULL)
         except Exception:
             pass
+        time.sleep(0.2)
+        for obj, handlers in (
+                (webrtc, (self._on_negotiation_needed, self._on_ice_candidate,
+                          self._log_state, self._on_deep_element_added)),
+                (channel, (self._on_input,)),
+                (aq, (self._on_audio_overrun,)),
+                (gcc, (self._on_gcc_estimate,))):
+            if obj is None:
+                continue
+            for h in handlers:
+                try:
+                    obj.disconnect_by_func(h)
+                except Exception:       # never connected (TypeError) -- fine
+                    pass
+        del objs, pipeline, webrtc, channel, aq, gcc
+        gc.collect()
+        # Our copy of the PipeWire fd: pipewiresrc dup()s the one it's given
+        # and never closes the original, so it's ours to close -- after the
+        # element is gone, so it can't be mid-use of the descriptor.
+        if pw_fd is not None:
+            try:
+                os.close(pw_fd)
+            except OSError:
+                pass
 
     def _start_bus_watch(self) -> None:
         bus = self.pipeline.get_bus()
@@ -450,6 +608,8 @@ class MediaSession:
     # ----- monitor crop / controls ----------------------------------------
 
     def _apply_crop(self, index: int) -> None:
+        if self.crop is None:            # session closed; nothing to crop
+            return
         m = self.monitors[index]
         rx = self.frame_w / self.logical_w
         ry = self.frame_h / self.logical_h
@@ -467,6 +627,14 @@ class MediaSession:
         self._scale_m = scale
         self._off_x = (self.enc_w - cw * scale) / 2.0
         self._off_y = (self.enc_h - ch * scale) / 2.0
+        if self.window:
+            # Window capture: frame px are the window's X pixels; the injector
+            # wants desktop logical px, so scale by (logical size / frame size)
+            # and offset by where the window sits on the desktop.
+            self._map_scale_x = self.window["w"] / float(self.frame_w)
+            self._map_scale_y = self.window["h"] / float(self.frame_h)
+            self._map_off_x = float(self.window["x"])
+            self._map_off_y = float(self.window["y"])
 
     def switch_monitor(self, index: int) -> None:
         if not (0 <= index < len(self.monitors)):
@@ -515,7 +683,10 @@ class MediaSession:
     def set_bitrate(self, kbps: int) -> None:
         # Client-driven bitrate = the ceiling. With GCC active, raise/lower the
         # estimator's max and let it adapt; otherwise drive the encoder directly.
-        kbps = max(500, int(kbps))
+        # Clamped: the value comes straight off the wire from any authenticated
+        # session (viewers included), and an absurd one overflows the encoder's
+        # bits/sec property.
+        kbps = max(500, min(_MAX_BITRATE_KBPS, int(kbps)))
         self.max_bitrate_kbps = kbps
         if self._gcc is not None:
             try:
@@ -541,6 +712,8 @@ class MediaSession:
         self.send({
             "type": "monitors",
             "active": self.active,
+            "source": "window" if self.window else "desktop",
+            "title": self.window["title"] if self.window else "",
             "list": [{"index": i, "width": m["w"], "height": m["h"],
                       "name": m["name"]} for i, m in enumerate(self.monitors)],
         })
@@ -572,8 +745,10 @@ class MediaSession:
             py = max(0.0, min(1.0, ev["y"])) * self.enc_h
             lx = max(0.0, min(float(self._cw), (px - self._off_x) / self._scale_m))
             ly = max(0.0, min(float(self._ch), (py - self._off_y) / self._scale_m))
-            p.pointer_motion_absolute(self._cl + lx, self._ct + ly,
-                                      node_id=self.combined_node)
+            p.pointer_motion_absolute(
+                self._map_off_x + (self._cl + lx) * self._map_scale_x,
+                self._map_off_y + (self._ct + ly) * self._map_scale_y,
+                node_id=self.combined_node)
         elif t == "monitor":
             self.switch_monitor(int(ev.get("index", 0)))
         elif t == "button":

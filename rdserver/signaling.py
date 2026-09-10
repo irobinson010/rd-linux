@@ -26,10 +26,45 @@ log = logging.getLogger("signaling")
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
-# Failed-auth throttle: after this many bad-token attempts from one IP within the
-# window, reject further attempts (a cheap brake on token guessing).
-_AUTH_MAX_FAILS = 8
+# Failed-auth throttle: each bad-token attempt from one IP within the window
+# answers a little slower (a tarpit), up to a cap. It never refuses to check a
+# token -- see Server._role_for for why a hard lockout is the wrong tool here.
 _AUTH_WINDOW_S = 30.0
+_AUTH_DELAY_STEP_S = 0.5
+_AUTH_DELAY_MAX_S = 3.0
+_AUTH_MAX_TRACKED = 256        # bound on the per-IP table
+
+# Largest encode size a client may ask for (8K). The request is otherwise
+# unbounded, and videoscale would allocate gigabytes per frame for an absurd
+# size before the encoder ever got the chance to refuse it.
+_MAX_ENC_W, _MAX_ENC_H = 7680, 4320
+
+# How long a silent portal re-negotiation (self-heal) may wait on each D-Bus
+# request. It runs on the event loop, so a portal that never answers would
+# otherwise freeze every client -- and still look "active" to systemd.
+_PORTAL_HEAL_TIMEOUT_S = 10.0
+
+# WebSocket close codes the client understands (4000-4999 = application use).
+WS_VIEW_REVOKED = 4001         # controller revoked minted view links
+WS_REPLACED = 4002             # another control session took over
+WS_SOURCE_CHANGED = 4003       # capture source flipped (game window <-> desktop)
+
+# Debounce for fullscreen-window changes: a game starting up toggles state and
+# geometry a few times in quick succession; one reconnect is plenty.
+_GAME_DEBOUNCE_S = 0.4
+
+# How long to wait with zero sessions before giving adaptive sync back. A
+# capture-source flip reconnects everyone within a second; toggling VRR twice
+# for that would blank the monitor twice.
+_VRR_RESTORE_GRACE_S = 3.0
+
+
+def _token_eq(a: str, b: str) -> bool:
+    """Constant-time equality that tolerates any input. secrets.compare_digest
+    raises TypeError on non-ASCII *str* arguments, which would turn a stray
+    character in ?token= into an HTTP 500 (and skip the failure counter);
+    comparing the UTF-8 bytes is defined for everything."""
+    return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
 class ScrubAccessLogger(AbstractAccessLogger):
@@ -42,15 +77,56 @@ class ScrubAccessLogger(AbstractAccessLogger):
                          response.status, time_taken)
 
 
+@web.middleware
+async def security_headers(request: web.Request, handler):
+    """Browser-hardening headers on every non-WebSocket response.
+
+    The CSP pins scripts and styles to this origin (nothing inline), the
+    signaling WebSocket to this host, and forbids framing -- clickjacking a
+    remote-desktop page would hand an attacker real clicks on the host. No HSTS:
+    with the default self-signed cert it would make the one-time certificate
+    warning impossible to click through."""
+    resp = await handler(request)
+    if resp.prepared:            # WebSocket upgrade: headers already on the wire
+        return resp
+    host = request.host          # what the client connected to (LAN IP, Twingate)
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self'; "
+        f"connect-src 'self' wss://{host} ws://{host}; "
+        "img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; "
+        "form-action 'none'; object-src 'none'")
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return resp
+
+
 class Server:
     def __init__(self, portal: Portal, *, token: str, bitrate_kbps: int,
-                 force_software: bool, rtp_port_min: int = 50000,
-                 rtp_port_max: int = 50019, audio: bool = False,
+                 force_software: bool, audio: bool = False,
                  codec: str = "h264", congestion_control: bool = False,
                  injector=None, view_token: str | None = None,
-                 max_viewers: int = 4, view_ttl_s: int = 12 * 3600):
+                 max_viewers: int = 4, view_ttl_s: int = 12 * 3600,
+                 capture_fps: int = 60, base_url: str = ""):
         self.portal = portal          # single capture of the whole desktop
         self.codec = codec
+        self.capture_fps = capture_fps
+        # Public base of the connect URL ("https://host:port"), for building
+        # shareable links in the local API (the browser client uses its own
+        # location.origin instead). Empty -> the API omits full URLs.
+        self.base_url = base_url.rstrip("/")
+        # Game-window capture (see gamewatch.py): while an X11 window is
+        # fullscreen and active, every session captures THAT window instead of
+        # the desktop, so KWin's screencast goes idle and the game stops
+        # flickering. _game holds the window with its rect in logical px.
+        self._game: dict | None = None
+        self._game_pending: dict | None = None
+        self._game_timer: asyncio.TimerHandle | None = None
+        self._watcher = None
+        # Adaptive sync off while anyone is connected (see vrr.py); None = keep.
+        self._vrr = None
+        self._vrr_timer: asyncio.TimerHandle | None = None
         self.token = token
         self.view_token = view_token   # optional static view-only token (--view-token)
         # All currently-valid view-only tokens -> expiry deadline (time.monotonic)
@@ -63,18 +139,18 @@ class Server:
         self.max_viewers = max_viewers
         self.bitrate_kbps = bitrate_kbps
         self.force_software = force_software
-        self.rtp_port_min = rtp_port_min
-        self.rtp_port_max = rtp_port_max
         self.audio = audio
         self.congestion_control = congestion_control
         self.injector = injector       # uinput injector (unattended) or None=portal
         # One controller (full input) + up to max_viewers view-only sessions. Each
         # connection gets its own MediaSession/pipeline (WebRTC is point-to-point).
-        # Viewers keep their WebSocket + whether they used the static token, so
-        # revocation can kick minted-link viewers immediately (not just block
-        # new connects) while leaving static-token viewers alone.
-        self._controller: MediaSession | None = None
-        self._viewers: list[dict] = []   # {media, ws, static}
+        # Every session keeps its WebSocket so it can be closed from elsewhere:
+        # a replaced controller is told it was replaced, and revocation kicks
+        # minted-link viewers immediately (not just blocks new connects) while
+        # leaving static-token viewers alone.
+        self._controller: dict | None = None   # {media, ws}
+        self._viewers: list[dict] = []          # {media, ws, static}
+        self._tasks: set[asyncio.Task] = set()  # fire-and-forget closes
         self._auth_fail: dict[str, list] = {}   # ip -> [fail_count, window_start]
         # Clipboard sync (controller only). One shared remote clipboard; _clip_last
         # is the last text seen in EITHER direction, so our own watcher doesn't
@@ -85,13 +161,19 @@ class Server:
                  "enabled" if self.clipboard_enabled
                  else "disabled (install wl-clipboard to enable)")
 
-        self.app = web.Application()
+        self.app = web.Application(middlewares=[security_headers])
         self.app.add_routes([
             web.get("/", self._index),
             web.get("/app.js", self._appjs),
             web.get("/style.css", self._stylecss),
             web.get("/favicon.ico", self._favicon),
             web.get("/ws", self._ws),
+            # Local control API (tray indicator etc.). Guarded by the CONTROL
+            # token, which already grants full control, so this adds no power;
+            # it just lets a non-browser tool see status and mint view links.
+            web.get("/api/status", self._api_status),
+            web.post("/api/view-link", self._api_view_link),
+            web.post("/api/revoke-views", self._api_revoke_views),
         ])
 
     # Never cache the client: avoids stale JS/CSS during iteration.
@@ -109,15 +191,19 @@ class Server:
     async def _favicon(self, _request: web.Request) -> web.StreamResponse:
         return web.Response(status=204)
 
-    def _role_for(self, request: web.Request) -> str | None:
-        """Constant-time token check with a per-IP failed-attempt throttle.
-        Returns 'control', 'view', or None (invalid / throttled)."""
+    def _role_for(self, request: web.Request) -> tuple[str | None, float]:
+        """Constant-time token check. Returns (role, delay_s): role is
+        'control', 'view', or None for an invalid token; delay_s is how long
+        the caller should stall before answering a failure.
+
+        Failures are slowed down, never locked out. The throttle is keyed by
+        source IP, but behind the Twingate connector (which runs on this host)
+        every remote client shares ONE address -- a hard lockout would let a
+        single mistyped token block everybody for the window. A growing delay
+        on failed attempts keeps guessing slow, while a correct token always
+        gets straight in."""
         ip = request.remote or "?"
         now = time.monotonic()
-        rec = self._auth_fail.get(ip)
-        if rec and now - rec[1] < _AUTH_WINDOW_S and rec[0] >= _AUTH_MAX_FAILS:
-            log.warning("auth throttled for %s", ip)
-            return None
         # Drop expired minted view tokens before matching against them.
         for vt, deadline in list(self.view_tokens.items()):
             if deadline is not None and now > deadline:
@@ -125,19 +211,146 @@ class Server:
                 log.info("view-only token expired")
         token = request.query.get("token", "")
         role = None
-        if secrets.compare_digest(token, self.token):
+        if _token_eq(token, self.token):
             role = "control"
-        elif token and any(secrets.compare_digest(token, vt)
-                           for vt in self.view_tokens):
+        elif token and any(_token_eq(token, vt) for vt in self.view_tokens):
             role = "view"
         if role is not None:
             self._auth_fail.pop(ip, None)
-            return role
+            return role, 0.0
+        rec = self._auth_fail.get(ip)
         if not rec or now - rec[1] >= _AUTH_WINDOW_S:
-            self._auth_fail[ip] = [1, now]
+            if len(self._auth_fail) >= _AUTH_MAX_TRACKED:
+                # Bound the table: forget every entry outside the window.
+                self._auth_fail = {k: v for k, v in self._auth_fail.items()
+                                   if now - v[1] < _AUTH_WINDOW_S}
+                if len(self._auth_fail) >= _AUTH_MAX_TRACKED:
+                    self._auth_fail.clear()
+            rec = self._auth_fail[ip] = [0, now]
+        rec[0] += 1
+        log.warning("auth failed for %s (%d in window)", ip, rec[0])
+        return None, min(_AUTH_DELAY_MAX_S, _AUTH_DELAY_STEP_S * rec[0])
+
+    def _kick(self, ws: web.WebSocketResponse, code: int, reason: bytes) -> None:
+        """Close ANOTHER connection's WebSocket without waiting on it. close()
+        waits (up to its timeout) for the peer's close frame, and a phone that
+        has gone to sleep would stall the caller's own session for that long."""
+        async def go() -> None:
+            try:
+                await ws.close(code=code, message=reason)
+            except Exception:          # already gone
+                pass
+        task = asyncio.get_running_loop().create_task(go())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    # ----- adaptive sync (VRR) guard ------------------------------------------
+
+    def enable_vrr_guard(self) -> None:
+        """VRR off on capable monitors while any session is connected."""
+        from rdserver.vrr import VrrGuard
+        self._vrr = VrrGuard()
+
+        async def on_startup(_app) -> None:
+            await self._vrr.restore_leftover()   # a crashed run may have left it off
+
+        async def on_cleanup(_app) -> None:
+            if self._vrr_timer:
+                self._vrr_timer.cancel()
+            await self._vrr.restore()
+        self.app.on_startup.append(on_startup)
+        self.app.on_cleanup.append(on_cleanup)
+
+    def _session_count(self) -> int:
+        return (1 if self._controller else 0) + len(self._viewers)
+
+    def _vrr_wanted_off(self) -> bool:
+        """VRR goes off only while a fullscreen game is being streamed. On a
+        plain desktop 'automatic' VRR isn't engaged, so there is nothing to
+        gain -- and changing the policy makes KWin reconfigure the output,
+        which kills the portal screencast a desktop session depends on (seen
+        as 'error set output format' + a reconnect). With a game fullscreen
+        every session is on the Xwayland grab, which that can't touch."""
+        return self._session_count() > 0 and self._game is not None
+
+    def _vrr_update(self) -> None:
+        """Reconcile the VRR policy with the current sessions + game state."""
+        if self._vrr is None:
+            return
+        if self._vrr_wanted_off():
+            if self._vrr_timer:             # a restore was pending: keep it off
+                self._vrr_timer.cancel()
+                self._vrr_timer = None
+            self._spawn(self._vrr.suspend())
+        elif self._vrr_timer is None:
+            # Grace period: a capture-source flip reconnects everyone within a
+            # second; toggling VRR for that would blank the monitor twice.
+            self._vrr_timer = asyncio.get_running_loop().call_later(
+                _VRR_RESTORE_GRACE_S, self._vrr_restore_if_idle)
+
+    def _vrr_restore_if_idle(self) -> None:
+        self._vrr_timer = None
+        if not self._vrr_wanted_off():
+            self._spawn(self._vrr.restore())
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.get_running_loop().create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    # ----- game-window capture ---------------------------------------------
+
+    def enable_game_capture(self) -> None:
+        """Watch for a fullscreen X11 window once the event loop runs."""
+        async def on_startup(_app) -> None:
+            from rdserver.gamewatch import FullscreenWatcher
+            loop = asyncio.get_running_loop()
+            watcher = FullscreenWatcher(
+                lambda info: loop.call_soon_threadsafe(self._on_fullscreen, info))
+            if watcher.start():
+                self._watcher = watcher
+        self.app.on_startup.append(on_startup)
+
+    def _on_fullscreen(self, info: dict | None) -> None:
+        """Watcher callback (on the loop): convert X px -> logical desktop px,
+        debounce, then flip sessions whose capture source no longer matches."""
+        game = None
+        if info and self._watcher and self.portal.width and self._watcher.root_w:
+            sx = self._watcher.root_w / self.portal.width       # Xwayland scale
+            sy = (self._watcher.root_h / self.portal.height
+                  if self.portal.height and self._watcher.root_h else sx)
+            game = {"xid": info["xid"], "title": info["title"],
+                    "x": int(round(info["x"] / sx)), "y": int(round(info["y"] / sy)),
+                    "w": max(1, int(round(info["w"] / sx))),
+                    "h": max(1, int(round(info["h"] / sy)))}
+        self._game_pending = game
+        if self._game_timer:
+            self._game_timer.cancel()
+        self._game_timer = asyncio.get_running_loop().call_later(
+            _GAME_DEBOUNCE_S, self._apply_game)
+
+    def _apply_game(self) -> None:
+        self._game_timer = None
+        game = self._game_pending
+        if game == self._game:
+            return
+        self._game = game
+        if game:
+            log.info("fullscreen window active: %r (xid 0x%x) at %d,%d %dx%d -> "
+                     "capturing the window", game["title"], game["xid"],
+                     game["x"], game["y"], game["w"], game["h"])
         else:
-            rec[0] += 1
-        return None
+            log.info("no fullscreen window -> capturing the desktop")
+        sessions = ([self._controller] if self._controller else []) + list(self._viewers)
+        flipped = 0
+        for s in sessions:
+            have = s["media"].window
+            if bool(have) != bool(game) or (have and have["xid"] != game["xid"]):
+                self._kick(s["ws"], WS_SOURCE_CHANGED, b"capture source changed")
+                flipped += 1
+        if flipped:
+            log.info("switching %d session(s) to the new capture source", flipped)
+        self._vrr_update()
 
     def _start_media(self, **kw) -> MediaSession:
         """Create a MediaSession; if the portal capture session has died, rebuild
@@ -149,6 +362,14 @@ class Server:
         connect fails with GDBus "Invalid session" until the service is restarted.
         In --unattended mode the saved restore token lets us re-negotiate with NO
         dialog, so a dead capture heals transparently on the next connect."""
+        if self._game:
+            try:
+                return MediaSession(self.portal, window=self._game, **kw)
+            except Exception as e:                   # noqa: BLE001
+                # The window may have vanished a moment ago; the watcher will
+                # report that shortly. Serve the desktop meanwhile.
+                log.warning("window capture of %r failed (%s); using the desktop",
+                            self._game["title"], e)
         try:
             return MediaSession(self.portal, **kw)
         except (GLib.Error, PortalError) as e:
@@ -158,7 +379,7 @@ class Server:
                 raise
             log.warning("portal capture session is dead (%s) -- re-negotiating "
                         "from the saved grant and retrying", e)
-            self.portal.negotiate()
+            self.portal.negotiate(timeout_s=_PORTAL_HEAL_TIMEOUT_S)
             return MediaSession(self.portal, **kw)
 
     async def _clipboard_watch(self, ws: web.WebSocketResponse) -> None:
@@ -182,8 +403,10 @@ class Server:
             pass   # ws went away between the closed-check and the send
 
     async def _ws(self, request: web.Request) -> web.StreamResponse:
-        role = self._role_for(request)
+        role, delay = self._role_for(request)
         if role is None:
+            if delay:
+                await asyncio.sleep(delay)   # tarpit the guesser, not the server
             return web.Response(status=403, text="invalid or missing token")
 
         ws = web.WebSocketResponse(heartbeat=20)
@@ -192,10 +415,16 @@ class Server:
         log.info("client connected: %s (%s)", peer, role)
 
         if role == "control":
-            # One controller at a time: a new control connection replaces the old.
-            if self._controller is not None:
-                self._controller.close()
+            # One controller at a time: a new control connection replaces the
+            # old -- which is TOLD (close code 4002) so its UI can say so instead
+            # of sitting on a frozen frame, and so it doesn't auto-reconnect and
+            # fight the new device for control.
+            old = self._controller
+            if old is not None:
                 self._controller = None
+                old["media"].close()
+                self._kick(old["ws"], WS_REPLACED,
+                           b"replaced by a new control session")
         else:  # view
             if len(self._viewers) >= self.max_viewers:
                 await ws.send_str(json.dumps(
@@ -205,14 +434,15 @@ class Server:
                 return ws
 
         # Initial encode resolution chosen by the client (it reconnects to change
-        # it, which is far more reliable than reconfiguring mid-stream).
+        # it, which is far more reliable than reconfiguring mid-stream), clamped
+        # to something a real display could be.
         try:
             req_w = int(request.query.get("w", 0))
             req_h = int(request.query.get("h", 0))
         except ValueError:
             req_w = req_h = 0
-        max_w = req_w if req_w >= 320 else 2560
-        max_h = req_h if req_h >= 240 else 1440
+        max_w = min(req_w, _MAX_ENC_W) if req_w >= 320 else 2560
+        max_h = min(req_h, _MAX_ENC_H) if req_h >= 240 else 1440
         try:
             monitor_index = int(request.query.get("monitor", 0))
         except ValueError:
@@ -237,11 +467,11 @@ class Server:
             media = self._start_media(
                 send_cb=send_cb, bitrate_kbps=self.bitrate_kbps,
                 force_software=self.force_software, on_error=on_error,
-                rtp_port_min=self.rtp_port_min, rtp_port_max=self.rtp_port_max,
                 audio=self.audio, max_width=max_w, max_height=max_h,
                 monitor_index=monitor_index, vmode=vmode,
                 congestion_control=self.congestion_control,
-                injector=self.injector, allow_input=(role == "control"))
+                injector=self.injector, allow_input=(role == "control"),
+                capture_fps=self.capture_fps)
         except Exception as e:
             log.exception("failed to start media session")
             await ws.send_str(json.dumps({"type": "error", "message": str(e)}))
@@ -249,14 +479,14 @@ class Server:
             return ws
 
         if role == "control":
-            self._controller = media
+            self._controller = {"media": media, "ws": ws}
         else:
             # Static-token viewers survive "revoke view links" (their token is
             # config, not a minted link) -- remember which kind this one is.
             tok = request.query.get("token", "")
-            is_static = bool(self.view_token
-                             and secrets.compare_digest(tok, self.view_token))
+            is_static = bool(self.view_token and _token_eq(tok, self.view_token))
             self._viewers.append({"media": media, "ws": ws, "static": is_static})
+        self._vrr_update()
         # Tell the client its role so it can show/hide the control UI. Clipboard
         # sync is a controller-only capability (a viewer must not read/write the
         # host clipboard); advertise it so the client shows the clipboard UI.
@@ -276,55 +506,110 @@ class Server:
                     data = json.loads(msg.data)
                 except ValueError:
                     continue
+                if not isinstance(data, dict):
+                    continue
                 kind = data.get("type")
-                if kind == "answer":
-                    media.set_remote_answer(data["sdp"])
-                elif kind == "ice":
-                    media.add_ice(data.get("sdpMLineIndex", 0), data["candidate"])
-                elif kind == "make_view_link" and role == "control":
-                    # Only a controller may mint a view-only token. It expires
-                    # after view_ttl_s (0 = lives until the server restarts).
-                    t = secrets.token_urlsafe(16)
-                    deadline = (time.monotonic() + self.view_ttl_s
-                                if self.view_ttl_s else None)
-                    self.view_tokens[t] = deadline
-                    log.info("control session generated a view-only token%s",
-                             f" (expires in {self.view_ttl_s // 3600}h)"
-                             if self.view_ttl_s else "")
-                    send_cb({"type": "view_link", "token": t,
-                             "ttl_s": self.view_ttl_s or None})
-                elif kind == "revoke_view_links" and role == "control":
-                    # Kill every minted view link: forget the tokens AND kick the
-                    # viewers using them now. The static --view-token (config) and
-                    # its viewers are untouched.
-                    minted = [vt for vt, dl in self.view_tokens.items()
-                              if vt != self.view_token]
-                    for vt in minted:
-                        del self.view_tokens[vt]
-                    kicked = [v for v in self._viewers if not v["static"]]
-                    for v in kicked:
-                        await v["ws"].close(
-                            code=4001, message=b"view access revoked")
-                    log.info("control revoked %d view token(s), disconnected "
-                             "%d viewer(s)", len(minted), len(kicked))
-                    send_cb({"type": "view_revoked", "tokens": len(minted),
-                             "viewers": len(kicked)})
-                elif kind == "clipboard" and role == "control":
-                    # Browser -> remote: set the host clipboard. Record it as
-                    # _clip_last first so the watcher below doesn't immediately
-                    # read it back and echo it to the browser.
-                    text = data.get("text", "")
-                    if isinstance(text, str) and self.clipboard_enabled:
-                        self._clip_last = text
-                        await clipboard.write_clipboard(text)
+                try:
+                    await self._handle(media, role, kind, data, send_cb)
+                except (KeyError, TypeError, ValueError) as e:
+                    # A malformed message must not take down the sender's own
+                    # session (it would propagate out of the loop and close it).
+                    log.warning("bad %r message from %s: %s", kind, peer, e)
         finally:
             if clip_task:
                 clip_task.cancel()
             log.info("client disconnected: %s (%s)", peer, role)
             media.close()
-            if self._controller is media:
+            if self._controller is not None and self._controller["media"] is media:
                 self._controller = None
             else:
                 self._viewers = [v for v in self._viewers
                                  if v["media"] is not media]
+            self._vrr_update()
         return ws
+
+    # ----- view-link mint / revoke (shared by WS and the local API) --------
+
+    def _mint_view_token(self, *, via: str) -> str:
+        """Create a view-only token that expires after view_ttl_s (0 = never)."""
+        t = secrets.token_urlsafe(16)
+        self.view_tokens[t] = (time.monotonic() + self.view_ttl_s
+                               if self.view_ttl_s else None)
+        log.info("view-only token minted (%s)%s", via,
+                 f", expires in {self.view_ttl_s // 3600}h"
+                 if self.view_ttl_s else "")
+        return t
+
+    def _revoke_view_links(self, *, via: str) -> tuple[int, int]:
+        """Forget every minted view token and disconnect its viewers. The
+        static --view-token (config) and its viewers are left alone.
+        Returns (tokens revoked, viewers kicked)."""
+        minted = [vt for vt in self.view_tokens if vt != self.view_token]
+        for vt in minted:
+            del self.view_tokens[vt]
+        kicked = [v for v in self._viewers if not v["static"]]
+        for v in kicked:
+            self._kick(v["ws"], WS_VIEW_REVOKED, b"view access revoked")
+        log.info("revoked %d view token(s), disconnected %d viewer(s) (%s)",
+                 len(minted), len(kicked), via)
+        return len(minted), len(kicked)
+
+    # ----- local control API (token-guarded JSON) --------------------------
+
+    def _api_ok(self, request: web.Request) -> bool:
+        """The control token, from ?token= or an X-RD-Token header."""
+        tok = request.query.get("token") or request.headers.get("X-RD-Token", "")
+        return _token_eq(tok, self.token)
+
+    async def _api_status(self, request: web.Request) -> web.Response:
+        if not self._api_ok(request):
+            return web.json_response({"error": "unauthorized"}, status=403)
+        game = self._game
+        return web.json_response({
+            "ok": True,
+            "controller": self._controller is not None,
+            "viewers": len(self._viewers),
+            "max_viewers": self.max_viewers,
+            "source": "window" if game else "desktop",
+            "game": game["title"] if game else None,
+            "view_links": sum(1 for t in self.view_tokens if t != self.view_token),
+            "base_url": self.base_url,
+        })
+
+    async def _api_view_link(self, request: web.Request) -> web.Response:
+        if not self._api_ok(request):
+            return web.json_response({"error": "unauthorized"}, status=403)
+        t = self._mint_view_token(via="local API")
+        return web.json_response({
+            "token": t, "ttl_s": self.view_ttl_s or None,
+            "url": f"{self.base_url}/?token={t}" if self.base_url else None})
+
+    async def _api_revoke_views(self, request: web.Request) -> web.Response:
+        if not self._api_ok(request):
+            return web.json_response({"error": "unauthorized"}, status=403)
+        tokens, viewers = self._revoke_view_links(via="local API")
+        return web.json_response({"tokens": tokens, "viewers": viewers})
+
+    async def _handle(self, media: MediaSession, role: str, kind: str | None,
+                      data: dict, send_cb) -> None:
+        """One signaling message from an authenticated client."""
+        if kind == "answer":
+            media.set_remote_answer(str(data["sdp"]))
+        elif kind == "ice":
+            media.add_ice(int(data.get("sdpMLineIndex", 0)), str(data["candidate"]))
+        elif kind == "make_view_link" and role == "control":
+            t = self._mint_view_token(via="control session")
+            send_cb({"type": "view_link", "token": t,
+                     "ttl_s": self.view_ttl_s or None})
+        elif kind == "revoke_view_links" and role == "control":
+            tokens, viewers = self._revoke_view_links(via="control session")
+            send_cb({"type": "view_revoked", "tokens": tokens,
+                     "viewers": viewers})
+        elif kind == "clipboard" and role == "control":
+            # Browser -> remote: set the host clipboard. Record it as
+            # _clip_last first so the watcher doesn't immediately read it
+            # back and echo it to the browser.
+            text = data.get("text", "")
+            if isinstance(text, str) and self.clipboard_enabled:
+                self._clip_last = text
+                await clipboard.write_clipboard(text)

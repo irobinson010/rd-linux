@@ -1,6 +1,6 @@
 "use strict";
 
-console.log("rdclient build 29 loaded");
+console.log("rdclient build 30 loaded");
 
 const params = new URLSearchParams(location.search);
 // The token arrives once via ?token=… then lives in localStorage; scrub it from
@@ -32,6 +32,7 @@ const video = document.getElementById("screen");
 const stage = document.getElementById("stage");
 const overlay = document.getElementById("overlay");
 const overlayText = document.getElementById("overlay-text");
+const overlayBtn = document.getElementById("overlay-btn");
 const monitorsEl = document.getElementById("monitors");
 const fillBtn = document.getElementById("fill");
 const soundBtn = document.getElementById("sound");
@@ -95,24 +96,88 @@ function setStatus(text, cls) {
   statusEl.className = cls || "";
 }
 
-function showOverlay(text) {
+// Optional action button (label + handler) under the overlay text, e.g. "Retry".
+function showOverlay(text, actionLabel, actionFn) {
   overlayText.textContent = text;
+  overlayBtn.hidden = !actionLabel;
+  overlayBtn.textContent = actionLabel || "";
+  overlayBtn.onclick = actionFn || null;
   overlay.classList.remove("hidden");
 }
 function hideOverlay() { overlay.classList.add("hidden"); }
 
 // ---- signaling -----------------------------------------------------------
 
-let reconnecting = false;
+let reconnectTimer = null;     // pending automatic reconnect
+let reconnectAttempt = 0;      // consecutive failures (drives the backoff)
+let lastServerError = "";      // last {type:"error"} text, for the retry status
+// Re-take control once the next (re)connect delivers media. Set whenever a
+// session that WAS controlling is torn down for a reconnect, so a blip on the
+// phone doesn't silently turn taps back into pinch/pan until you find the
+// "Take control" button again. Consumed by pc.ontrack.
+let resumeControl = false;
+
+// Drop the current signaling socket WITHOUT running its onclose handler -- for
+// deliberate reconnects (resolution change, retry) so they aren't mistaken for
+// a network drop.
+function closeWs() {
+  if (!ws) return;
+  ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+  try { ws.close(); } catch (e) { /* ignore */ }
+  ws = null;
+}
 
 // Monitor switches and resolution changes both reconnect with the new settings
 // -- a clean fresh stream, far more reliable than reconfiguring it live.
 function reconnect(statusMsg) {
-  reconnecting = true;
+  cancelReconnect();
+  resumeControl = controlling || resumeControl;
   setStatus(statusMsg || "reconnecting…");
   teardown();
-  if (ws) { try { ws.close(); } catch (e) { /* ignore */ } ws = null; }
-  setTimeout(() => { reconnecting = false; connect(); }, 400);
+  closeWs();
+  setTimeout(connect, 400);
+}
+
+// Automatic recovery from anything unexpected -- network blip, phone sleep,
+// server restart, pipeline error: retry with exponential backoff (1s … 15s),
+// indefinitely. A remote-desktop client that dead-ends on "disconnected" is one
+// you have to reload by hand every time the server hiccups.
+function scheduleReconnect(why) {
+  if (reconnectTimer) return;
+  reconnectAttempt++;
+  const delay = Math.min(15000, 1000 * Math.pow(2, reconnectAttempt - 1));
+  setStatus(why + " · retrying in " + Math.round(delay / 1000) + "s", "err");
+  showOverlay(why + ". Reconnecting…", "Retry now", retryNow);
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
+}
+function cancelReconnect() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+}
+function retryNow() {
+  cancelReconnect();
+  teardown();
+  closeWs();
+  showOverlay("Connecting…");
+  connect();
+}
+// "Take it back" after another device took over: reconnect AND take control.
+function takeBack() {
+  resumeControl = true;
+  retryNow();
+}
+// Coming back to the tab (phone unlocked, window refocused) retries at once
+// instead of waiting out the backoff.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && reconnectTimer) retryNow();
+});
+
+// Was the WebSocket refused because the token is bad, or because the server
+// isn't there? The browser hides the difference (both close with 1006), so ask
+// the server itself: a plain HEAD that gets answered means it's up and the
+// token was rejected; a network failure means it's down (or restarting).
+function probeServer() {
+  return fetch(location.pathname, { method: "HEAD", cache: "no-store" })
+    .then((r) => r.status < 500, () => false);
 }
 
 // If nothing decodes within the window, the browser can't play this codec --
@@ -134,9 +199,10 @@ function maybeFallback() {
 }
 
 function connect() {
+  closeWs();                       // never two signaling sockets at once
   decodedOk = false;
-  if (fallbackTimer) clearTimeout(fallbackTimer);
-  fallbackTimer = setTimeout(maybeFallback, 9000);
+  lastServerError = "";
+  if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const [w, h] = resSel.value.split("x");   // chosen encode resolution
   ws = new WebSocket(`${proto}://${location.host}/ws?token=`
@@ -146,19 +212,42 @@ function connect() {
   let opened = false;   // did the upgrade succeed? (a 403 closes before onopen)
   ws.onopen = () => { opened = true; setStatus("signaling connected, negotiating…"); };
   ws.onclose = (e) => {
-    if (reconnecting) return;            // deliberate reconnect, not a drop
+    ws = null;
+    resumeControl = controlling || resumeControl;   // before teardown clears it
     teardown();
     if (e.code === 4001) {               // controller revoked view access
+      resumeControl = false;
       setStatus("view access revoked", "err");
       showOverlay("The controller revoked view access.");
+    } else if (e.code === 4002) {        // another device took control
+      // Deliberately NO auto-reconnect: two devices would kick each other in
+      // a loop. The person can take it back with one click.
+      resumeControl = false;
+      setStatus("replaced by another session", "err");
+      showOverlay("Another device took control of this machine.",
+        "Take it back", takeBack);
+    } else if (e.code === 4003) {        // capture source flipped (game <-> desktop)
+      // Expected and quick: reconnect right away, keep control if we had it.
+      reconnectAttempt = 0;
+      setStatus("switching capture…");
+      showOverlay("Switching capture…");
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 300);
     } else if (!opened) {
-      // Rejected before the upgrade: bad/expired token (or server unreachable).
-      // Re-prompt rather than dead-ending -- the stored token may be stale.
-      setStatus("not authorized", "err");
-      showTokenPrompt("Couldn't connect: the access token was rejected (or the " +
-        "server is unreachable). Enter the current token to try again.");
+      // Rejected before the upgrade. Bad/expired token -> re-prompt rather
+      // than dead-ending (the stored token may be stale). Server down or
+      // restarting -> keep retrying.
+      probeServer().then((up) => {
+        if (up) {
+          setStatus("not authorized", "err");
+          showTokenPrompt("The access token was rejected. Enter the current " +
+            "token to try again.");
+        } else {
+          scheduleReconnect("server unreachable");
+        }
+      });
     } else {
-      setStatus("disconnected", "err");
+      scheduleReconnect(lastServerError
+        ? "server error: " + lastServerError : "disconnected");
     }
   };
   ws.onerror = () => setStatus("signaling error", "err");
@@ -174,7 +263,7 @@ function connect() {
         });
       } catch (err) { console.warn("addIceCandidate", err); }
     } else if (msg.type === "monitors") {
-      renderMonitors(msg.list, msg.active);
+      renderMonitors(msg.list, msg.active, msg.source, msg.title);
     } else if (msg.type === "role") {
       applyRole(msg.control);
       clipboardEnabled = !!msg.clipboard;
@@ -189,6 +278,7 @@ function connect() {
       setStatus("revoked " + msg.tokens + " view link(s), disconnected "
         + msg.viewers + " viewer(s)", "ok");
     } else if (msg.type === "error") {
+      lastServerError = String(msg.message || "");
       setStatus("server error: " + msg.message, "err");
       showOverlay("Server error: " + msg.message);
     }
@@ -227,6 +317,13 @@ function newPeerConnection() {
 
   pc.ontrack = (e) => {
     console.log("ontrack fired: kind=" + e.track.kind);
+    // Ask for the smallest jitter buffer the browser will give us. The default
+    // adaptive playout delay is tuned for video calls and quietly adds tens of
+    // milliseconds on a clean LAN; a remote desktop would rather drop a frame.
+    try {
+      if ("jitterBufferTarget" in e.receiver) e.receiver.jitterBufferTarget = 0;
+      if ("playoutDelayHint" in e.receiver) e.receiver.playoutDelayHint = 0;
+    } catch (err) { console.warn("playout delay hint:", err); }
     // Collect every track (video AND audio) into one stream -- don't let the
     // audio track (which arrives with its own stream id) replace the video.
     if (!remoteStream) {
@@ -238,6 +335,11 @@ function newPeerConnection() {
     setStatus("connected", "ok");
     controlBtn.disabled = !canControl;     // view-only sessions can't take control
     hideOverlay();
+    reconnectAttempt = 0;                  // media flowing: backoff starts over
+    if (resumeControl) {                   // we were controlling before the drop
+      resumeControl = false;
+      setControlling(true);
+    }
     startStats();
   };
 
@@ -251,9 +353,12 @@ function newPeerConnection() {
   pc.onconnectionstatechange = () => {
     console.log("connectionState:", pc.connectionState);
     if (pc.connectionState === "failed") {
-      setStatus("connection failed (check Twingate / firewall UDP)", "err");
-      showOverlay("WebRTC connection failed. Over Twingate, make sure UDP to " +
-        "this machine is permitted for the media ports.");
+      // ICE gave up (network changed, tunnel dropped, or UDP is blocked). A
+      // fresh session fixes the first two; the status text names the third.
+      resumeControl = controlling || resumeControl;
+      teardown();
+      closeWs();
+      scheduleReconnect("connection failed (check Twingate / firewall UDP)");
     }
   };
 }
@@ -263,14 +368,21 @@ async function onOffer(sdp) {
   await pc.setRemoteDescription({ type: "offer", sdp });
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
-  ws.send(JSON.stringify({ type: "answer", sdp: pc.localDescription.sdp }));
+  wsSend({ type: "answer", sdp: pc.localDescription.sdp });
   // If the browser rejected the video m-line (answers "m=video 0"), it has no
   // decoder for this codec at all -- don't wait the whole watchdog, fall back now.
   if (/^m=video 0 /m.test(pc.localDescription.sdp || "")) {
     console.log("browser rejected the video m-line -> immediate fallback");
-    if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
     maybeFallback();
+    return;
   }
+  // Codec watchdog: if nothing decodes within the window, this browser can't
+  // play the codec -> maybeFallback walks to the next one. Armed only HERE,
+  // once an offer has actually arrived: arming it on connect() made an
+  // unreachable server look like a codec failure, walking the chain down to
+  // VP8 and remembering that for the device.
+  if (fallbackTimer) clearTimeout(fallbackTimer);
+  fallbackTimer = setTimeout(maybeFallback, 9000);
 }
 
 function teardown() {
@@ -283,23 +395,51 @@ function teardown() {
   remoteStream = null;
 }
 
-// Log inbound video stats so a black screen can be diagnosed: are frames
-// actually arriving (bytesReceived rising) and decoding (framesDecoded rising)?
+// Inbound video stats, two jobs: diagnose a black screen (are frames arriving
+// and decoding?) and show where latency goes -- the receive-side jitter buffer,
+// decode time and network round trip, as per-interval averages in the status
+// bar. Server-side encode/capture time is the remainder you feel on top.
+let prevStats = null;
 function startStats() {
   if (statsTimer) return;
+  prevStats = null;
   statsTimer = setInterval(async () => {
     if (!pc) return;
     const stats = await pc.getStats();
-    let found = false;
+    let found = false, rtt = null;
+    stats.forEach((r) => {
+      if (r.type === "candidate-pair" && r.state === "succeeded" && r.nominated
+          && typeof r.currentRoundTripTime === "number") {
+        rtt = r.currentRoundTripTime;
+      }
+    });
     stats.forEach((r) => {
       if (r.type === "inbound-rtp" && (r.kind === "video" || r.mediaType === "video")) {
         found = true;
+        const cur = {
+          frames: r.framesDecoded || 0, jbDelay: r.jitterBufferDelay || 0,
+          jbCount: r.jitterBufferEmittedCount || 0, decTime: r.totalDecodeTime || 0,
+          t: performance.now(),
+        };
+        let detail = "";
+        if (prevStats) {
+          const dFrames = cur.frames - prevStats.frames;
+          const dJb = cur.jbCount - prevStats.jbCount;
+          const fps = dFrames / ((cur.t - prevStats.t) / 1000);
+          const jbMs = dJb > 0 ? (cur.jbDelay - prevStats.jbDelay) / dJb * 1000 : null;
+          const decMs = dFrames > 0 ? (cur.decTime - prevStats.decTime) / dFrames * 1000 : null;
+          detail = ` · ${fps.toFixed(0)} fps`
+            + (jbMs != null ? ` · buffer ${jbMs.toFixed(0)} ms` : "")
+            + (decMs != null ? ` · decode ${decMs.toFixed(1)} ms` : "")
+            + (rtt != null ? ` · rtt ${(rtt * 1000).toFixed(0)} ms` : "");
+        }
+        prevStats = cur;
         console.log(`video in: recv=${r.bytesReceived}B ` +
           `framesReceived=${r.framesReceived} framesDecoded=${r.framesDecoded} ` +
           `size=${r.frameWidth}x${r.frameHeight} ` +
-          `keyframes=${r.keyFramesDecoded} dropped=${r.framesDropped}`);
-        setStatus(`connected · ${r.frameWidth || "?"}×${r.frameHeight || "?"} · ` +
-          `${r.framesDecoded || 0} frames`, "ok");
+          `keyframes=${r.keyFramesDecoded} dropped=${r.framesDropped}${detail}`);
+        setStatus(`connected${sourceLabel ? " · " + sourceLabel : ""} · `
+          + `${r.frameWidth || "?"}×${r.frameHeight || "?"}${detail}`, "ok");
         // Frames decoding -> this mode works; cancel the fallback watchdog.
         if ((r.framesDecoded || 0) > 0) {
           decodedOk = true;
@@ -334,7 +474,7 @@ function wsSend(obj) {
 // Reading the local clipboard silently needs permission (Chrome/Edge grant it on
 // a gesture); where it's blocked, the panel textarea is the universal fallback.
 function updateClipUI() {
-  clipbtn.style.display = (clipboardEnabled && canControl) ? "" : "none";
+  clipbtn.hidden = !(clipboardEnabled && canControl);
 }
 
 function onRemoteClipboard(text) {
@@ -376,7 +516,9 @@ window.addEventListener("focus", pushLocalClipboard);
 
 // Toolbar buttons to switch which monitor is streamed (live server-side crop of
 // the one desktop capture -- instant, no reconnect).
-function renderMonitors(list, active) {
+let sourceLabel = "";   // "game: MTGA" while a fullscreen window is captured
+function renderMonitors(list, active, source, title) {
+  sourceLabel = source === "window" ? "game: " + (title || "window") : "";
   monitorList = list || [];
   monitorsEl.innerHTML = "";
   if (monitorList.length <= 1) { activeMonitor = active || 0; return; }
@@ -482,7 +624,7 @@ function applyRole(control) {
     controlBtn.classList.remove("active");
     keyboardBtn.style.display = "none";   // typing does nothing for a viewer
     sharebtn.style.display = "none";      // viewers can't mint links
-    clipbtn.style.display = "none";       // clipboard is controller-only
+    clipbtn.hidden = true;                // clipboard is controller-only
   }
 }
 
@@ -764,27 +906,15 @@ function sendChar(ch) {
   if (m) tapKey(m[0], m[1]);
 }
 
-// TEMP on-screen keyboard-event debug (remove once Enter is sorted).
-const kbddbg = document.getElementById("kbddbg");
-let dbgLines = [];
-function dbg(s) {
-  dbgLines.unshift(s);
-  dbgLines = dbgLines.slice(0, 8);
-  kbddbg.textContent = dbgLines.join("\n");
-  kbddbg.classList.remove("hidden");
-}
-
 // Physical/named keys forward directly. Skip IME composition (keyCode 229 / empty
-// code) -- those characters come through the 'input' handler below instead.
+// code) -- those characters come through the 'beforeinput' handler below instead.
 kbdInput.addEventListener("keydown", (e) => {
-  dbg("kd code=" + (e.code || "none") + " key=" + e.key + " kc=" + e.keyCode + " comp=" + e.isComposing);
   if (e.isComposing || e.keyCode === 229 || !e.code) return;
   e.preventDefault(); e.stopPropagation();
   pressedKeys.add(e.code);
   sendInput({ t: "key", code: e.code, pressed: true });
 });
 kbdInput.addEventListener("keyup", (e) => {
-  dbg("ku code=" + (e.code || "none") + " key=" + e.key);
   if (!e.code) return;
   e.preventDefault(); e.stopPropagation();
   pressedKeys.delete(e.code);
@@ -794,10 +924,7 @@ kbdInput.addEventListener("keyup", (e) => {
 // Mobile soft keyboards: 'beforeinput' reports the intent (text, line break,
 // backspace) reliably even when keydown gives no .code and the return key inserts
 // no newline. We act on it and preventDefault so the hidden field stays empty.
-kbdInput.addEventListener("input", (e) =>
-  dbg("in it=" + e.inputType + " data=" + JSON.stringify(e.data)));
 kbdInput.addEventListener("beforeinput", (e) => {
-  dbg("bi it=" + e.inputType + " data=" + JSON.stringify(e.data));
   const it = e.inputType;
   if (it === "insertText" && e.data != null) {
     for (const ch of e.data) sendChar(ch);
@@ -825,7 +952,6 @@ function toggleKeyboard() {
 keyboardBtn.addEventListener("click", toggleKeyboard);
 kbdInput.addEventListener("focus", () => keyboardBtn.classList.add("active"));
 kbdInput.addEventListener("blur", () => {
-  dbg("blur");
   keyboardBtn.classList.remove("active");
   kbdInput.value = ""; kbdLast = "";
 });
