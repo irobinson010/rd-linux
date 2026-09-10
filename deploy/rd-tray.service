@@ -1,0 +1,25 @@
+# rd-tray -- system-tray indicator for rdserver (separate from the server).
+#
+# Shows whether the server is live and who's connected, and mints view-only
+# links from a menu. It needs your graphical session (the tray, clipboard,
+# notifications), so it's a --user service started at graphical login.
+#
+#   systemctl --user enable --now rd-tray
+#
+# It reads the port + control token from ~/.config/rdserver/rd.env, same as the
+# server, and talks to the server over localhost.
+
+[Unit]
+Description=rdserver system-tray indicator
+After=graphical-session.target rdserver.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/rd-linux
+ExecStart=/usr/bin/python3 -m rdserver.tray
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
