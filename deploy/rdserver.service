@@ -21,7 +21,26 @@ PartOf=graphical-session.target
 StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+# notify: systemd counts the service as started only when rdserver says READY=1,
+# i.e. after the portal handshake -- which on a FIRST run waits for you to approve
+# the KDE share dialog, hence the long TimeoutStartSec. The watchdog then restarts
+# the service if the event loop stops pinging (rdserver/sdnotify.py): a wedged
+# process looks "active" to Restart=on-failure, but not to this.
+Type=notify
+TimeoutStartSec=10min
+WatchdogSec=90
+# Each WebRTC session opens ~60 descriptors (ICE candidates on every interface,
+# eventfds, pipes); the user-service default soft limit of 1024 is one bad
+# afternoon away, and GLib aborts the process when it can't open a pipe.
+LimitNOFILE=65536
+# Stay out of the way of whatever the person at the machine is doing. With the
+# cgroup CPU controller active (it is, on a Plasma session) a game and this
+# service sit in sibling groups of equal weight, so under contention a software
+# encode here steals frame time from the game -- seen as black frames on a VRR
+# panel. A low weight makes the game win; nothing here needs to be on time to
+# the millisecond (Nice= covers the same for anything sharing our group).
+CPUWeight=20
+Nice=10
 # Path to your checkout (install.sh rewrites this to the real location).
 WorkingDirectory=%h/rd-linux
 # Default options. NOTE: there is deliberately no token here -- install.sh writes

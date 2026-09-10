@@ -26,6 +26,7 @@ PORTAL_PATH = "/org/freedesktop/portal/desktop"
 IFACE_REMOTE = "org.freedesktop.portal.RemoteDesktop"
 IFACE_SCREENCAST = "org.freedesktop.portal.ScreenCast"
 IFACE_REQUEST = "org.freedesktop.portal.Request"
+IFACE_SESSION = "org.freedesktop.portal.Session"
 
 log = logging.getLogger("portal")
 
@@ -68,6 +69,7 @@ class Portal:
         self._sender = name[1:].replace(".", "_")  # -> "1_42"
         self._token_seq = 0
         self._cursor = cursor
+        self.cursor = cursor          # public: other capture paths honour it too
         # capture_only: ScreenCast-only + persistence (input handled by uinput).
         # Lets the capture grant persist so restarts don't re-prompt (unattended).
         # Public: signaling checks it to decide whether a dead session can be
@@ -90,11 +92,18 @@ class Portal:
         return f"{PORTAL_PATH}/request/{self._sender}/{token}"
 
     def _request(self, iface: str, method: str, body: GLib.Variant,
-                 options: dict) -> dict:
+                 options: dict, timeout_s: float | None = None) -> dict:
         """Call a portal method that returns a Request, wait for its Response.
 
         `body` is everything *before* the trailing options dict; `options` is the
         a{sv} we augment with a handle_token. Returns the results dict (a{sv}).
+
+        `timeout_s` bounds BOTH the method call and the wait for its Response
+        signal. None means wait indefinitely for the Response (right for the
+        interactive first start, where a human has to click the share dialog);
+        the method call itself then still gets GDBus's default 25 s. Callers on
+        the server's event loop must pass a timeout: a portal that accepted the
+        request and then died would otherwise park the whole process here.
         """
         token = self._next_token()
         options = dict(options)
@@ -110,24 +119,39 @@ class Portal:
             holder["results"] = results
             loop.quit()
 
+        def on_timeout() -> bool:
+            holder["timed_out"] = True
+            loop.quit()
+            return False               # one-shot: the source removes itself
+
         sub = self.conn.signal_subscribe(
             PORTAL_BUS, IFACE_REQUEST, "Response", req_path, None,
             Gio.DBusSignalFlags.NONE, on_response, None)
 
         # Splice the options a{sv} onto the end of the call body tuple.
         full = _append_options(body, options)
+        call_timeout_ms = int(timeout_s * 1000) if timeout_s else -1
 
+        timer = None
         try:
             self.conn.call_sync(
                 PORTAL_BUS, PORTAL_PATH, iface, method, full,
-                GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None)
+                GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE,
+                call_timeout_ms, None)
+            if timeout_s:
+                timer = GLib.timeout_add(call_timeout_ms, on_timeout)
+            loop.run()
         except GLib.Error as e:
-            self.conn.signal_unsubscribe(sub)
             raise PortalError(f"{iface}.{method} call failed: {e}") from e
+        finally:
+            self.conn.signal_unsubscribe(sub)
+            if timer is not None and not holder.get("timed_out"):
+                GLib.source_remove(timer)
 
-        loop.run()
-        self.conn.signal_unsubscribe(sub)
-
+        if holder.get("timed_out"):
+            raise PortalError(
+                f"{iface}.{method}: no Response from the portal within "
+                f"{timeout_s:g}s (is xdg-desktop-portal running?)")
         if holder.get("code") != 0:
             raise PortalError(
                 f"{iface}.{method} denied/cancelled (response={holder.get('code')}). "
@@ -136,16 +160,36 @@ class Portal:
 
     # ----- the negotiation handshake ---------------------------------------
 
-    def negotiate(self) -> None:
+    def negotiate(self, timeout_s: float | None = None) -> None:
         """Create + start the portal session. Re-callable: if the existing session
         dies (PipeWire or xdg-desktop-portal restarted), calling this again builds
-        a fresh one -- silently in capture-only mode thanks to the restore token."""
-        if self.capture_only:
-            self._negotiate_capture_only()
-        else:
-            self._negotiate_with_input()
+        a fresh one -- silently in capture-only mode thanks to the restore token.
 
-    def _negotiate_with_input(self) -> None:
+        `timeout_s` caps each portal request (see _request). Pass one when
+        re-negotiating from the server's event loop; leave None at startup."""
+        self._close_session()          # best-effort: drop a dead/half-built one
+        try:
+            if self.capture_only:
+                self._negotiate_capture_only(timeout_s)
+            else:
+                self._negotiate_with_input(timeout_s)
+        except PortalError:
+            self._close_session()      # don't leave a half-built session behind
+            raise
+
+    def _close_session(self) -> None:
+        """Ask the portal to close the current session (fire-and-forget)."""
+        if not self.session_handle:
+            return
+        try:
+            self.conn.call(
+                PORTAL_BUS, self.session_handle, IFACE_SESSION, "Close",
+                None, None, Gio.DBusCallFlags.NONE, 1000, None, None)
+        except GLib.Error:
+            pass
+        self.session_handle = None
+
+    def _negotiate_with_input(self, timeout_s: float | None = None) -> None:
         # Combined RemoteDesktop (input) + ScreenCast (capture) on one session.
         # NB: KDE forbids persist_mode/restore_token on a RemoteDesktop session
         # ("Remote desktop sessions cannot persist"), so this path's share dialog
@@ -156,7 +200,7 @@ class Portal:
         res = self._request(
             IFACE_REMOTE, "CreateSession",
             GLib.Variant("()", ()),
-            {"session_handle_token": GLib.Variant("s", sess_token)})
+            {"session_handle_token": GLib.Variant("s", sess_token)}, timeout_s)
         self.session_handle = res["session_handle"]
 
         # 2) Pick screen sources (ScreenCast interface, same session).
@@ -167,21 +211,22 @@ class Portal:
                 "u", CURSOR_EMBEDDED if self._cursor else CURSOR_HIDDEN),
         }
         self._request(IFACE_SCREENCAST, "SelectSources",
-                      _obj(self.session_handle), src_opts)
+                      _obj(self.session_handle), src_opts, timeout_s)
 
         # 3) Pick input devices (RemoteDesktop interface).
         self._request(IFACE_REMOTE, "SelectDevices",
                       _obj(self.session_handle),
-                      {"types": GLib.Variant("u", DEVICE_KEYBOARD | DEVICE_POINTER)})
+                      {"types": GLib.Variant("u", DEVICE_KEYBOARD | DEVICE_POINTER)},
+                      timeout_s)
 
         # 4) Start -- this is what pops the KDE "share your screen" dialog.
         start_res = self._request(
             IFACE_REMOTE, "Start",
             GLib.Variant("(os)", (self.session_handle, "")),
-            {})
+            {}, timeout_s)
         self._parse_streams(start_res.get("streams") or [])
 
-    def _negotiate_capture_only(self) -> None:
+    def _negotiate_capture_only(self, timeout_s: float | None = None) -> None:
         # ScreenCast-only (no RemoteDesktop -- input is via the uinput injector).
         # KDE *does* allow persistence for plain ScreenCast, so we request
         # persist_mode=PERSISTENT and reuse a saved restore_token: the dialog
@@ -191,7 +236,7 @@ class Portal:
         res = self._request(
             IFACE_SCREENCAST, "CreateSession",
             GLib.Variant("()", ()),
-            {"session_handle_token": GLib.Variant("s", sess_token)})
+            {"session_handle_token": GLib.Variant("s", sess_token)}, timeout_s)
         self.session_handle = res["session_handle"]
 
         src_opts = {
@@ -205,12 +250,12 @@ class Portal:
             src_opts["restore_token"] = GLib.Variant("s", restore_token)
             log.info("screencast: reusing saved restore token (expect no dialog)")
         self._request(IFACE_SCREENCAST, "SelectSources",
-                      _obj(self.session_handle), src_opts)
+                      _obj(self.session_handle), src_opts, timeout_s)
 
         start_res = self._request(
             IFACE_SCREENCAST, "Start",
             GLib.Variant("(os)", (self.session_handle, "")),
-            {})
+            {}, timeout_s)
         new_token = start_res.get("restore_token")
         if new_token:
             self._write_restore_token(new_token)
@@ -263,7 +308,10 @@ class Portal:
 
     def open_pipewire_fd(self) -> int:
         """Open a fresh PipeWire remote fd (call once per GStreamer pipeline)."""
-        assert self.session_handle
+        if not self.session_handle:
+            # A PortalError (not an assert) so the signaling self-heal path
+            # treats "no session" like "dead session" and re-negotiates.
+            raise PortalError("no portal session (previous negotiation failed)")
         ret, fdlist = self.conn.call_with_unix_fd_list_sync(
             PORTAL_BUS, PORTAL_PATH, IFACE_SCREENCAST, "OpenPipeWireRemote",
             GLib.Variant("(oa{sv})", (self.session_handle, {})),

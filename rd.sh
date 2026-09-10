@@ -23,7 +23,7 @@ if [ -z "${WAYLAND_DISPLAY:-}" ]; then
   done
 fi
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 UNIT="$HOME/.config/systemd/user/rdserver.service"
 LOG="$PROJECT_DIR/rdserver.log"
 # Options for the direct-run fallback. Load the generated token file if present (the
@@ -37,6 +37,20 @@ RD_OPTS="${RD_OPTS:---port 8098 --tls --audio --unattended}"
 
 have_service() { [ -f "$UNIT" ]; }
 
+# The unit as it should be installed: deploy/rdserver.service pointed at THIS
+# checkout (a verbatim copy ships WorkingDirectory=%h/rd-linux).
+render_unit() {
+  sed -E "s|^WorkingDirectory=.*|WorkingDirectory=$PROJECT_DIR|" \
+    "$PROJECT_DIR/deploy/rdserver.service"
+}
+unit_stale() { ! render_unit | cmp -s - "$UNIT" 2>/dev/null; }
+install_unit() {
+  mkdir -p "$(dirname "$UNIT")"
+  render_unit > "$UNIT"
+  systemctl --user daemon-reload
+  echo "installed/updated $UNIT"
+}
+
 show_url() {  # pull the connect URL out of recent logs
   local url
   url="$( { systemctl --user -q is-active rdserver >/dev/null 2>&1 \
@@ -48,19 +62,31 @@ show_url() {  # pull the connect URL out of recent logs
 
 case "${1:-start}" in
   install)
-    mkdir -p "$HOME/.config/systemd/user"
-    # Same rewrite install.sh does: point the unit at THIS checkout. A verbatim
-    # copy ships WorkingDirectory=%h/rd-linux, which breaks any other location.
-    sed -E "s|^WorkingDirectory=.*|WorkingDirectory=$PROJECT_DIR|" \
-      "$PROJECT_DIR/deploy/rdserver.service" > "$UNIT"
-    systemctl --user daemon-reload
-    echo "installed/updated $UNIT"
+    if unit_stale; then
+      install_unit
+      if systemctl --user -q is-active rdserver 2>/dev/null; then
+        echo "NOTE: the service is running under the OLD unit; restart it now (./rd.sh start)."
+        echo "      (A changed WatchdogSec can be enforced on the running process after the reload.)"
+      fi
+    else
+      echo "unit already up to date: $UNIT"
+    fi
     echo "start now: ./rd.sh start   |   auto-start at login: systemctl --user enable rdserver"
     ;;
   start)
     if have_service; then
-      echo "starting via systemd --user service..."
-      systemctl --user restart rdserver || { echo "start failed -- ./rd.sh log"; exit 1; }
+      if unit_stale; then
+        # The unit changed (e.g. after a git pull): stop the old instance BEFORE the
+        # daemon-reload so systemd never enforces new Type=/WatchdogSec= settings
+        # against a process that doesn't speak them, then install and start fresh.
+        echo "unit changed -- reinstalling it and restarting..."
+        systemctl --user stop rdserver 2>/dev/null
+        install_unit
+        systemctl --user start rdserver || { echo "start failed -- ./rd.sh log"; exit 1; }
+      else
+        echo "starting via systemd --user service..."
+        systemctl --user restart rdserver || { echo "start failed -- ./rd.sh log"; exit 1; }
+      fi
       sleep 1
     else
       echo "service not installed (./rd.sh install); running detached..."
