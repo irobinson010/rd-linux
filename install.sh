@@ -10,7 +10,7 @@
 # KDE Plasma (Wayland) + NVIDIA/NVENC is the target; software x264 is a fallback.
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # ---- 1. system packages ------------------------------------------------------
 PKGS=(
@@ -26,6 +26,10 @@ PKGS=(
   python3-gi                         # PyGObject
   python3-aiohttp                    # HTTP + WebSocket signaling
   python3-evdev                      # virtual input device for --unattended mode
+  python3-xlib                       # fullscreen-game detection (window capture via Xwayland)
+  gir1.2-gtk-3.0                     # tray indicator (rd-tray) UI
+  gir1.2-ayatanaappindicator3-0.1    # tray indicator (rd-tray) status icon
+  libnotify-bin                      # desktop notifications from the tray (notify-send)
   pulseaudio-utils                   # pactl (find the default sink for --audio)
   wl-clipboard                       # wl-copy/wl-paste for shared-clipboard sync
   openssl                            # self-signed TLS cert for --tls
@@ -77,8 +81,15 @@ mkdir -p "$UNIT_DIR"
 sed -E "s|^WorkingDirectory=.*|WorkingDirectory=$PROJECT_DIR|" \
   "$PROJECT_DIR/deploy/rdserver.service" > "$UNIT_DIR/rdserver.service"
 systemctl --user daemon-reload 2>/dev/null || true
+sed -E "s|^WorkingDirectory=.*|WorkingDirectory=$PROJECT_DIR|" \
+  "$PROJECT_DIR/deploy/rd-tray.service" > "$UNIT_DIR/rd-tray.service"
+systemctl --user daemon-reload 2>/dev/null || true
 echo
 echo "==> Installed systemd --user service (rdserver) -> $UNIT_DIR/rdserver.service"
+if systemctl --user -q is-active rdserver 2>/dev/null; then
+  echo "    NOTE: rdserver is currently running under the previous unit -- restart it"
+  echo "    now with ./rd.sh start so the new unit (watchdog) applies to a fresh process."
+fi
 
 # ---- 5. next steps ----------------------------------------------------------
 cat <<EOF
@@ -87,6 +98,7 @@ Install complete.
 
   Start it:            ./rd.sh start
   Auto-start at login: systemctl --user enable rdserver
+  Tray icon (status + view links): systemctl --user enable --now rd-tray
   Status / logs:       ./rd.sh status   |   ./rd.sh log
   Stop:                ./rd.sh stop
 

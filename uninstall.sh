@@ -9,13 +9,15 @@ set -uo pipefail
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 echo "==> Stopping + disabling the service..."
-systemctl --user stop rdserver 2>/dev/null || true
-systemctl --user disable rdserver 2>/dev/null || true
+systemctl --user stop rdserver rd-tray 2>/dev/null || true
+systemctl --user disable rdserver rd-tray 2>/dev/null || true
 
-UNIT="$HOME/.config/systemd/user/rdserver.service"
-if [ -f "$UNIT" ]; then rm -f "$UNIT" && echo "  removed $UNIT"; fi
+for u in rdserver rd-tray; do
+  f="$HOME/.config/systemd/user/$u.service"
+  if [ -f "$f" ]; then rm -f "$f" && echo "  removed $f"; fi
+done
 systemctl --user daemon-reload 2>/dev/null || true
-systemctl --user reset-failed rdserver 2>/dev/null || true
+systemctl --user reset-failed rdserver rd-tray 2>/dev/null || true
 
 echo "==> Removing generated config + cached cert/token..."
 rm -rf "$HOME/.config/rdserver" && echo "  removed ~/.config/rdserver (access token)"

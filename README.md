@@ -30,6 +30,7 @@ and an **unattended mode** you can start over SSH.
 
 - **KDE Plasma on Wayland** (developed on Plasma 6 / Kubuntu). Needs
   `xdg-desktop-portal-kde`, PipeWire, WirePlumber — standard on Kubuntu.
+- Xwayland (standard) for the fullscreen-game window capture; `python3-xlib`.
 - **NVIDIA GPU with NVENC** recommended (software x264 works but is heavier).
 - A browser on the client (Chrome/Edge/Safari ideal; Firefox & Linux browsers work via
   the automatic VP8 fallback).
@@ -87,7 +88,17 @@ cd rd-linux && ./rd.sh start
 ```
 
 The service runs inside your user session manager, so it keeps running after the SSH
-session closes, and restarts itself on failure.
+session closes, and restarts itself on failure **or hang**: the unit runs as
+`Type=notify` with a systemd watchdog that the server feeds from its event loop, so a
+process that is wedged but still "active" gets restarted too. After pulling changes
+that touch `deploy/rdserver.service`, `./rd.sh start` notices and reinstalls the unit
+for you (stop → reload → start, so the new watchdog is never enforced on the old
+process).
+
+The browser client **reconnects on its own** after a network blip, phone sleep, or
+server restart (exponential backoff, up to 15 s between tries), and a device whose
+control session was taken over by another one is told so, with a one-click
+"Take it back".
 
 ---
 
@@ -140,6 +151,83 @@ Each viewer is its own hardware encode, so keep the count modest (`--max-viewers
 default 4). Recipients must be able to reach the host (same Twingate/LAN), and the
 link carries a token — treat it like any other access link.
 
+## Fullscreen games: window capture
+
+Screen-capturing a monitor makes a **fullscreen game on it flicker** on KDE + NVIDIA:
+KWin keeps flipping the game between direct scanout and compositing while its
+screencast needs frames (KDE bug 517961 family). The server side-steps it: while an
+**X11 window is fullscreen and active** -- every Steam/Proton game, since they run
+under Xwayland -- all viewers capture **that window straight from Xwayland**
+(`ximagesrc`), KWin's screencast goes idle, and the game stops flickering. Viewers'
+status bar shows `game: <title>`. Leave the game (alt-tab, un-fullscreen, quit) and
+everyone flips back to the desktop capture. Each flip is a ~1 s reconnect; control is
+kept.
+
+What to expect:
+
+- **Viewers see only the game** while it is fullscreen (the other monitor, panels and
+  Wayland apps aren't reachable from Xwayland). For someone watching you play, that
+  is the better picture anyway.
+- **Native-Wayland games** aren't X11 windows, so they fall back to the desktop
+  capture (with the flicker). Proton's optional `PROTON_ENABLE_WAYLAND=1` would turn
+  a game into one -- leave it off if you want window capture.
+- Mouse/keyboard from the controller still work inside the game: the window's
+  position on the desktop is known, so input is mapped back onto it.
+- The grab runs at `--capture-fps` (capped at 60) and costs Xwayland about a fifth of
+  a core at 60. **Keep the server's total load modest while gaming:** the capture,
+  a software VP8 encode and audio together produced black frames on a VRR panel
+  where each alone did not, so the service runs at a low CPU weight, the software
+  encoders are limited to 4 threads, and 30 fps is a good gaming setting. Devices
+  that can decode H.264 cost almost nothing (NVENC); a viewer stuck on VP8 is the
+  expensive case -- clear the site's data on that browser once so it re-tests H.264.
+- Turn it off with `--game-capture off`. It needs `--unattended` (uinput input).
+
+**Adaptive sync (VRR) is switched off while a fullscreen game is being streamed.**
+Even with the window capture, the remaining capture + encode + audio load gives the
+game small frame-time hiccups, and a VRR panel shows those as **black frames**; each
+piece of the load alone did not do it, all of them together did, and setting the
+monitor's VRR to *Never* with the same load made them vanish. So whenever a viewer is
+connected *and* a fullscreen game is active, the server sets every VRR-enabled monitor
+to `never` (live, via `kscreen-doctor`) and restores the previous policy a few seconds
+after that stops being true, or when it exits. It deliberately leaves VRR alone for
+plain desktop sessions: `automatic` VRR isn't engaged there, and changing the policy
+makes KWin reconfigure the output, which interrupts the desktop screencast.
+The saved policy is also kept in `~/.cache/rdserver/vrr-saved.json`, so a crash can't
+leave a monitor without adaptive sync: the next start restores it first. Opt out with
+`--keep-vrr`.
+
+## Tray indicator (is it live? + view links)
+
+`rd-tray` puts a small icon in the system tray so you can see at a glance whether the
+server is up and who's connected, and hand out a view-only link without opening the
+browser client. It's a separate `--user` service:
+
+```bash
+systemctl --user enable --now rd-tray
+```
+
+- **Icon:** greyed-out = server not reachable · a display icon = live, nobody connected ·
+  a person icon = someone connected. The menu's top line spells it out
+  (`rdserver: live — controller (MTGA), 2/4 viewers`).
+- **Create view-only link** mints a link, copies it to your clipboard, and shows a
+  notification with its expiry. **Revoke view links** kills every minted link and
+  disconnects those viewers. **Copy control link** copies the full-control URL.
+- **Restart server** restarts rdserver (with a confirm — it drops the active session,
+  which reconnects itself).
+
+> **Opening the menu:** **left-click** the icon. Plasma's Wayland system tray has a
+> long-standing bug where an icon's **right-click** context menu closes as the pointer
+> moves onto it — this hits every tray icon, not just this one. As a menu-free shortcut,
+> **middle-click** the icon to mint and copy a view-only link directly. If left-click
+> menus also misbehave, restarting Plasma (`systemctl --user restart plasma-plasmashell`)
+> usually clears it.
+
+It reads the port and control token from `~/.config/rdserver/rd.env` and talks to the
+server over localhost via a small token-guarded API (`/api/status`, `/api/view-link`,
+`/api/revoke-views`) — the same API is there if you want to script view links. For the
+links to be reachable from another device, set `--public-host` (or `RD_PUBLIC_HOST`) to
+your Twingate name/address so they aren't built with the LAN IP.
+
 ## Shared clipboard
 
 The **controller** shares a clipboard with the remote PC (viewers don't — it's not
@@ -169,17 +257,20 @@ to `python3 -m rdserver` directly.
 | `--port N` | HTTP/signaling port (default 8089; the service uses 8098) |
 | `--token T` | fixed access token (default: random each start; `install.sh` pins one via the `RD_TOKEN` env var — preferred over the flag, which is visible in `ps`) |
 | `--view-token T` | second token for **view-only** access (watch, no control); also generatable in-app via "Share view" |
+| `--public-host H` | host/IP used in shareable links (connect URL, tray view links). Default: primary LAN IP; set to your Twingate name for remote links. Env: `RD_PUBLIC_HOST` |
 | `--max-viewers N` | max simultaneous view-only sessions (each is its own encode; default 4) |
 | `--view-ttl H` | lifetime (hours) of view links minted via "Share view" (default 12; 0 = until restart) |
 | `--tls` | serve HTTPS/WSS. With no cert flags it auto-generates a self-signed cert |
 | `--tls-cert FILE` | use a real certificate (PEM, full chain) — see "Custom domain" below |
 | `--tls-key FILE` | matching private key (PEM); must be readable by the service user |
 | `--audio` | stream system audio (taps the default sink monitor, stereo 48 kHz) |
+| `--keep-vrr` | leave monitors' adaptive sync alone (default: off while a session is connected, see "Fullscreen games") |
+| `--game-capture auto\|off` | capture a fullscreen X11/Proton game's window from Xwayland instead of the desktop (default auto; see "Fullscreen games") |
+| `--capture-fps N` | max frames/s requested from the compositor's screencast (1-120, default 60; the stream is 60 fps, so more is timing headroom only). See "Gaming" and "Laggy" in Troubleshooting |
 | `--unattended` | uinput input + persistent capture (SSH-startable; see above) |
 | `--bitrate K` | initial video bitrate kbps (default 20000; also live in the toolbar) |
 | `--abr` | adaptive bitrate (WebRTC congestion control). **Off by default** — see note |
 | `--av1` | force NVENC AV1 for all clients (needs `install-av1.sh` + a HW-AV1 client) |
-| `--udp-ports A-B` | RTP UDP port range (default 50000-50019) |
 | `--software` | force x264 software encoding instead of NVENC |
 | `--no-cursor` | don't embed the cursor in the video |
 | `-v` | verbose logging |
@@ -257,6 +348,14 @@ heavy. To re-test a sharper codec on a device that fell back, clear that site's 
 - This grants **full control of your desktop**. The first capture approval is a real KDE
   security prompt; `--unattended` remembers only the *capture* grant (input is local
   uinput). Revoking the share in KDE forces re-approval.
+- **Browser hardening.** Every page is served with a strict Content-Security-Policy
+  (scripts/styles from this origin only, signaling only to this host, no framing), plus
+  `nosniff` and a no-referrer policy. Wrong tokens are answered progressively *slower*
+  rather than locking an address out -- behind a Twingate connector every remote client
+  shares one source address, so a lockout would let one typo block everybody.
+- **Bounded requests.** Client-chosen encode size (≤ 8K) and bitrate (≤ 200 Mbps) are
+  clamped server-side, so a view-only session can't make the encoder allocate absurd
+  frames.
 
 ---
 
@@ -288,7 +387,24 @@ that can **decode** AV1 in hardware — software AV1 decode is usually too slow 
 - **Black screen in the browser** → it's almost always codec decode; the client should
   auto-fall-back to VP8 within a few seconds. Check the page console for `framesDecoded`.
 - **`connectionState: failed`** → WebRTC UDP isn't reaching the host (Twingate/firewall).
+  The client keeps retrying; fix the UDP path and it recovers by itself.
+- **"Another device took control"** → a second control session replaced this one (one
+  controller at a time). Click **Take it back** to reclaim it.
 - **Audio choppy** → make sure `--abr` is *off* (default).
+- **Laggy even on the LAN** → the status bar shows where the time goes once
+  connected: `fps`, the browser's receive `buffer`, `decode` time and network `rtt`.
+  Whatever is left is capture + encode on the host. Two cheap wins: pick **2160p**
+  in the resolution menu on a 1440p-class screen -- the crop is then encoded at its
+  native size with no scaling step at all -- and keep `--capture-fps` at 60.
+- **A game on the host flickers or stutters while someone is connected** → the
+  compositor renders and *downloads* the whole desktop for every captured frame, per
+  viewer. Older builds never limited that at the source, so KWin captured at the
+  panel's refresh (240 Hz on a gaming monitor) even though only 60 fps were used. The
+  server now asks for at most `--capture-fps` (default 60, up to 120); lower it in
+  `rd.env` to cut the load further, or raise it for timing headroom. If a VRR/adaptive-sync panel still flickers,
+  try setting that monitor's VRR to *Never* in System Settings → Display while a
+  viewer is connected: KWin composites differently while a screencast is active, and
+  refresh-rate swings are what VRR panels show as brightness flicker.
 - **Service won't start / restart loop** → `./rd.sh log`. Over SSH, use `./rd.sh`
   (it sets the env) rather than calling `python3` or `systemctl` bare.
 - **Every connect fails with `Invalid session`** → PipeWire or xdg-desktop-portal
@@ -309,13 +425,19 @@ uninstall.sh            remove the service + generated config
 install-av1.sh          optional: build the AV1 RTP payloader
 rd.sh                   control script (start/stop/status/log/install), SSH-safe
 deploy/rdserver.service systemd --user unit (token comes from ~/.config/rdserver/rd.env)
+deploy/rd-tray.service  systemd --user unit for the tray indicator
 rdserver/
   __main__.py           entry point + CLI
   portal.py             ScreenCast / RemoteDesktop portal negotiation (+ persistence)
   media.py              GStreamer webrtcbin pipeline (capture → NVENC → WebRTC) + dispatch
   uinput_inject.py      virtual keyboard + absolute pointer (unattended input)
-  signaling.py          aiohttp HTTP + WebSocket signaling, token auth
+  signaling.py          aiohttp HTTP + WebSocket signaling, token auth, security headers
+  sdnotify.py           systemd READY/WATCHDOG notifications (Type=notify unit)
   keymap.py             browser event codes → evdev codes
+  gamewatch.py          fullscreen X11 window watcher (game-window capture)
+  vrr.py                adaptive sync off while streaming (kscreen-doctor)
+  tray.py               system-tray indicator (status + view links); run as rd-tray.service
+  xerrors.py            non-fatal X error handler (a closed game window must not exit(1) us)
   smoketest.py          standalone capture+encode validator
 web/
   index.html / app.js / style.css   browser client
