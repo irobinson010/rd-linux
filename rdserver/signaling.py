@@ -12,6 +12,8 @@ import json
 import logging
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
@@ -152,6 +154,12 @@ class Server:
         self._viewers: list[dict] = []          # {media, ws, static}
         self._tasks: set[asyncio.Task] = set()  # fire-and-forget closes
         self._auth_fail: dict[str, list] = {}   # ip -> [fail_count, window_start]
+        # Pipelines are built here so their several seconds of blocking work
+        # (subprocesses, the PLAYING wait, portal self-heal) never stall the
+        # event loop. Single-threaded: builds serialize, so concurrent connects
+        # never run two portal GLib main loops at once.
+        self._media_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="media-build")
         # Clipboard sync (controller only). One shared remote clipboard; _clip_last
         # is the last text seen in EITHER direction, so our own watcher doesn't
         # echo back a value the browser just pushed (and vice-versa).
@@ -175,6 +183,10 @@ class Server:
             web.post("/api/view-link", self._api_view_link),
             web.post("/api/revoke-views", self._api_revoke_views),
         ])
+        self.app.on_cleanup.append(self._shutdown_executor)
+
+    async def _shutdown_executor(self, _app) -> None:
+        self._media_executor.shutdown(wait=False, cancel_futures=True)
 
     # Never cache the client: avoids stale JS/CSS during iteration.
     _NOCACHE = {"Cache-Control": "no-store, must-revalidate"}
@@ -464,14 +476,22 @@ class Server:
                 ws.close(code=1011, message=message.encode()[:120]), loop)
 
         try:
-            media = self._start_media(
+            # Build the pipeline OFF the event loop. MediaSession construction
+            # blocks for up to several seconds (kscreen-doctor + pactl
+            # subprocesses, the PLAYING state wait, a D-Bus fd open, and any
+            # portal self-heal); doing it inline froze every other session's
+            # heartbeats and messages meanwhile. The executor is single-threaded
+            # on purpose, so two concurrent connects build sequentially and no
+            # two portal handshakes ever run a GLib main loop at once.
+            media = await loop.run_in_executor(self._media_executor, partial(
+                self._start_media,
                 send_cb=send_cb, bitrate_kbps=self.bitrate_kbps,
                 force_software=self.force_software, on_error=on_error,
                 audio=self.audio, max_width=max_w, max_height=max_h,
                 monitor_index=monitor_index, vmode=vmode,
                 congestion_control=self.congestion_control,
                 injector=self.injector, allow_input=(role == "control"),
-                capture_fps=self.capture_fps)
+                capture_fps=self.capture_fps))
         except Exception as e:
             log.exception("failed to start media session")
             await ws.send_str(json.dumps({"type": "error", "message": str(e)}))

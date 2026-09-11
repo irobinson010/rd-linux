@@ -13,6 +13,7 @@ import secrets
 import socket
 import ssl
 import subprocess
+import sys
 from pathlib import Path
 
 # Make the locally-built gst-plugins-rs (rtpav1pay, for AV1) discoverable before
@@ -145,6 +146,14 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
+    # Under systemd, stdout is a pipe -> block-buffered, so the connect-URL
+    # banner (plain print) would sit unflushed for a long time and `./rd.sh
+    # start` couldn't find it in the journal. Line-buffer it.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
     Gst.init(None)
     enc = encoder_available()
     if not enc:
@@ -156,7 +165,10 @@ def main() -> int:
     # Token precedence: flag > environment > random. RD_TOKEN (set via the mode-600
     # rd.env the service loads) keeps the secret off the command line, where any
     # local process could read it from /proc/<pid>/cmdline or `ps`.
-    token = args.token or os.environ.get("RD_TOKEN") or secrets.token_urlsafe(16)
+    token = args.token or os.environ.get("RD_TOKEN")
+    token_random = token is None      # nothing configured -> we mint an ephemeral one
+    if token_random:
+        token = secrets.token_urlsafe(16)
     view_token = args.view_token or os.environ.get("RD_VIEW_TOKEN") or None
 
     # Set up the uinput injector first (fail fast before bothering with a dialog).
@@ -243,13 +255,24 @@ def main() -> int:
     print("\n" + "=" * 64)
     print("Remote desktop server ready. Open this in the laptop's browser")
     print("(over Twingate, use this machine's Twingate address instead of the LAN IP):")
-    print(f"\n    {base_url}/?token={token}\n")
-    print(f"token: {token}")
+    # Keep the access token OUT of stdout/journal when it's a configured secret
+    # (RD_TOKEN / --token): the journal is readable by the adm/systemd-journal
+    # groups. Only print it when we minted a random one this run -- there's no
+    # other way to learn that, and it dies with the process. `./rd.sh start`
+    # rebuilds the full URL from rd.env for the normal (configured) case.
+    if token_random:
+        print(f"\n    {base_url}/?token={token}\n")
+        print(f"token (random this run): {token}")
+    else:
+        print(f"\n    {base_url}/?token=<token>\n")
+        print("token: from ~/.config/rdserver/rd.env (not logged); "
+              "`./rd.sh start` prints the full URL")
     if public_host != ip:
         print(f"(--public-host {public_host}; LAN IP is {ip})")
     if view_token:
         print("\nview-only URL (share to let others WATCH, no control):")
-        print(f"    {base_url}/?token={view_token}")
+        vt = view_token if token_random else "<view-token>"
+        print(f"    {base_url}/?token={vt}")
     if not args.tls:
         print("note: signaling is plaintext -- add --tls for HTTPS/WSS so the "
               "token isn't exposed on the wire.")

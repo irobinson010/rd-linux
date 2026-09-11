@@ -51,13 +51,22 @@ install_unit() {
   echo "installed/updated $UNIT"
 }
 
-show_url() {  # pull the connect URL out of recent logs
-  local url
-  url="$( { systemctl --user -q is-active rdserver >/dev/null 2>&1 \
-              && journalctl --user -u rdserver -n 80 --no-pager 2>/dev/null \
-              || tail -n 80 "$LOG" 2>/dev/null; } \
-          | grep -oE 'https?://[^ ]*token=[^ ]+' | tail -1 )"
-  [ -n "$url" ] && echo "connect: $url" || echo "(no URL yet -- check './rd.sh log')"
+show_url() {  # build the connect URL: from rd.env when the server didn't log it
+  local logs base url
+  logs="$( { systemctl --user -q is-active rdserver >/dev/null 2>&1 \
+              && journalctl --user -u rdserver -n 120 --no-pager 2>/dev/null \
+              || tail -n 120 "$LOG" 2>/dev/null; } )"
+  # Configured-token case: the server logs a tokenless URL (the secret stays out
+  # of the journal). We hold RD_TOKEN from rd.env, so fill it in here.
+  base="$( printf '%s\n' "$logs" | grep -oE 'https?://[^ ]*/\?token=<token>' | tail -1 )"
+  if [ -n "$base" ] && [ -n "${RD_TOKEN:-}" ]; then
+    echo "connect: ${base/token=<token>/token=$RD_TOKEN}"; return
+  fi
+  # Random-token case: the full URL (real token) is in the log.
+  url="$( printf '%s\n' "$logs" | grep -oE 'https?://[^ ]*/\?token=[A-Za-z0-9_-]+' | tail -1 )"
+  if [ -n "$url" ]; then echo "connect: $url"
+  elif [ -n "$base" ]; then echo "connect: ${base%<token>}<token-in-~/.config/rdserver/rd.env>"
+  else echo "(no URL yet -- check './rd.sh log')"; fi
 }
 
 case "${1:-start}" in
