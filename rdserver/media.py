@@ -136,8 +136,9 @@ def default_monitor() -> str | None:
 
 
 def monitor_layout() -> list[dict]:
-    """Enabled outputs as [{name, x, y, w, h}] in logical coords (matching the
-    portal's combined frame), normalised to a (0,0) origin, left-to-right."""
+    """Enabled outputs as [{name, x, y, w, h, hz}] in logical coords (matching
+    the portal's combined frame), normalised to a (0,0) origin, left-to-right.
+    hz is the current mode's refresh rate (0 if unknown)."""
     try:
         out = subprocess.run(["kscreen-doctor", "-j"],
                              capture_output=True, text=True, timeout=3)
@@ -153,10 +154,12 @@ def monitor_layout() -> list[dict]:
         scale = o.get("scale") or 1          # `size` is physical; pos/frame logical
         w = int(round(int(size.get("width", 0)) / scale))
         h = int(round(int(size.get("height", 0)) / scale))
+        mode = {m.get("id"): m for m in o.get("modes") or []}.get(
+            o.get("currentModeId")) or {}
         if w and h:
             mons.append({"name": o.get("name", "?"),
                          "x": int(pos.get("x", 0)), "y": int(pos.get("y", 0)),
-                         "w": w, "h": h})
+                         "w": w, "h": h, "hz": float(mode.get("refreshRate") or 0)})
     mons.sort(key=lambda m: (m["x"], m["y"]))
     if mons:
         minx = min(m["x"] for m in mons)
@@ -165,6 +168,17 @@ def monitor_layout() -> list[dict]:
             m["x"] -= minx
             m["y"] -= miny
     return mons
+
+
+def capture_rate(requested: int, monitors: list[dict]) -> int:
+    """The max-framerate to ask KWin's desktop stream for. KWin offers it only
+    up to the fastest monitor's refresh rate truncated to whole Hz (119.88 ->
+    119), and pipewiresrc can't negotiate a max-framerate outside that range:
+    asking 120 of a 119.88 Hz panel failed every connect with "no more input
+    formats" (a black screen). Unknown refresh rates leave the request alone."""
+    fps = max(1, min(int(requested), _MAX_CAPTURE_FPS))
+    top_hz = int(max((m.get("hz", 0) for m in monitors), default=0))
+    return min(fps, top_hz) if top_hz else fps
 
 
 def fit_within(w: int, h: int, max_w: int, max_h: int) -> tuple[int, int]:
@@ -343,7 +357,10 @@ class MediaSession:
         # maps to PipeWire's maxFramerate, which KWin honours. Capturing above
         # self.fps buys nothing for the viewer (videorate drops the extra) but is
         # allowed up to _MAX_CAPTURE_FPS as timing headroom.
-        self.capture_fps = max(1, min(int(capture_fps), _MAX_CAPTURE_FPS))
+        self.capture_fps = capture_rate(capture_fps, self.monitors)
+        if self.capture_fps < min(int(capture_fps), _MAX_CAPTURE_FPS):
+            log.info("capture fps %d -> %d (fastest monitor's refresh rate)",
+                     capture_fps, self.capture_fps)
         fd = None if window else portal.open_pipewire_fd()
         self._pw_fd: int | None = fd      # closed in close(); see there
         try:
