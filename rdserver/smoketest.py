@@ -4,7 +4,7 @@ Run after picking BOTH screens in the share dialog:
 
     python3 -m rdserver.smoketest
 
-It captures + NVENC-encodes EACH shared monitor for a few seconds and reports how
+It captures + encodes (NVENC/VA-API/x264) EACH shared monitor for a few seconds and reports how
 many frames each produced. Use it to tell whether a black screen is a capture
 problem (0 frames for that monitor) or something downstream.
 """
@@ -18,7 +18,7 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
-from rdserver.media import encoder_available, fit_within  # noqa: E402
+from rdserver.media import _encoder_fragment, fit_within, select_encoder  # noqa: E402
 from rdserver.portal import Portal  # noqa: E402
 
 MAX_W, MAX_H = 2560, 1440
@@ -27,9 +27,7 @@ MAX_W, MAX_H = 2560, 1440
 def run_capture(portal: Portal, stream: dict, seconds: float = 3.0) -> tuple[int, str | None]:
     fd = portal.open_pipewire_fd()
     w, h = fit_within(stream["width"] or MAX_W, stream["height"] or MAX_H, MAX_W, MAX_H)
-    enc = encoder_available() or "x264enc"
-    encfrag = ("nvh264enc rc-mode=cbr zerolatency=true" if enc == "nvh264enc"
-               else "x264enc tune=zerolatency speed-preset=ultrafast")
+    encfrag = _encoder_fragment(select_encoder() or "x264enc", 8000)
     desc = (
         f"pipewiresrc fd={fd} path={stream['node_id']} do-timestamp=true "
         f"keepalive-time=1000 ! queue leaky=downstream max-size-buffers=4 ! "

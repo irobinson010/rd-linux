@@ -30,7 +30,7 @@ class _FakePortal:
 
 def _server():
     return signaling.Server(_FakePortal(), token="ctl-tok", bitrate_kbps=1000,
-                            force_software=True, view_token="view-tok",
+                            encoder="x264", view_token="view-tok",
                             base_url="https://host:8098")
 
 

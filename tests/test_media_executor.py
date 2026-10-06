@@ -42,7 +42,7 @@ def test_build_off_loop_and_nonblocking() -> None:
         return
 
     srv = signaling.Server(_FakePortal(), token="ctl", bitrate_kbps=1000,
-                           force_software=True)
+                           encoder="x264")
     seen: dict = {}
     started = threading.Event()
     release = threading.Event()

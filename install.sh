@@ -7,7 +7,8 @@
 #
 #     ./install.sh
 #
-# KDE Plasma (Wayland) + NVIDIA/NVENC is the target; software x264 is a fallback.
+# KDE Plasma (Wayland) is the target. Encodes with NVENC (NVIDIA) or VA-API (AMD/Intel,
+# via Mesa), whichever works; software x264 is the last resort.
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -18,7 +19,7 @@ PKGS=(
   gstreamer1.0-pipewire              # pipewiresrc: capture the portal's PipeWire node
   gstreamer1.0-plugins-base          # videoconvert, videoscale, audioconvert, opus
   gstreamer1.0-plugins-good          # rtp payloaders, pulsesrc, queue, videorate
-  gstreamer1.0-plugins-bad           # webrtcbin, nvcodec (nvh264enc/NVENC), dtls/srtp
+  gstreamer1.0-plugins-bad           # webrtcbin, nvcodec (NVENC), va (VA-API), dtls/srtp
   gstreamer1.0-plugins-ugly          # x264enc (software fallback)
   gstreamer1.0-nice                  # libnice ICE backend for webrtcbin
   gstreamer1.0-libav                 # extra codecs / fallback
@@ -45,11 +46,15 @@ for el in pipewiresrc webrtcbin rtph264pay opusenc videoconvert nicesink; do
   if gst-inspect-1.0 "$el" >/dev/null 2>&1; then echo "  OK      $el"
   else echo "  MISSING $el   <-- investigate"; fi
 done
+hw=0
 if gst-inspect-1.0 nvh264enc >/dev/null 2>&1; then
-  echo "  OK      nvh264enc (NVENC hardware H.264)"
-else
-  echo "  NOTE    nvh264enc missing -- needs the NVIDIA driver; will use software x264 (heavier)."
+  echo "  OK      nvh264enc (NVENC hardware H.264, NVIDIA)"; hw=1
 fi
+va=$(gst-inspect-1.0 va 2>/dev/null | grep -oE '\bva(renderD[0-9]+)?h264(lp)?enc\b' | head -1 || true)
+if [ -n "$va" ]; then
+  echo "  OK      $va (VA-API hardware H.264, AMD/Intel)"; hw=1
+fi
+[ $hw = 1 ] || echo "  NOTE    no hardware H.264 encoder (NVENC/VA-API) -- will use software x264 (heavier)."
 command -v kscreen-doctor >/dev/null 2>&1 \
   || echo "  NOTE    kscreen-doctor not found -- multi-monitor cropping falls back to one screen"
 echo "          (it ships with KDE Plasma; install your distro's libkfNscreen-bin to enable it)."

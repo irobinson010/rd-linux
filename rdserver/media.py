@@ -1,5 +1,5 @@
 """GStreamer webrtcbin pipeline: capture the whole desktop -> crop one monitor ->
-NVENC -> WebRTC, plus an input return path.
+hardware H.264 (NVENC or VA-API) -> WebRTC, plus an input return path.
 
 KDE's portal only ever hands back ONE stream covering the whole desktop (a logical
 frame = bounding box of all monitors), regardless of what you pick. So we capture
@@ -11,15 +11,21 @@ at runtime, so it's robust to logical/physical pixel differences.
 
     pipewiresrc(desktop, BGRA) -> videocrop -> videoscale -> [framerate stamp] ->
     nvh264enc (BGRA in, GPU convert) -> h264parse -> rtph264pay -> webrtcbin
-    (+ audio, + input channel). Software encoders get a threaded videoconvert.
+    (+ audio, + input channel). VA-API (AMD/Intel) and the software encoders
+    get a threaded videoconvert to NV12 first.
+
+The capture reaches us in system memory whichever GPU drives the monitors, so
+the encoder does not have to be on that GPU: see select_encoder().
 """
 
 from __future__ import annotations
 
+import functools
 import gc
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -60,11 +66,62 @@ _MAX_CAPTURE_FPS = 120
 _SW_THREADS = 4
 
 
-def encoder_available() -> str:
-    if Gst.ElementFactory.find("nvh264enc"):
-        return "nvh264enc"
-    if Gst.ElementFactory.find("x264enc"):
-        return "x264enc"
+# H.264 encoder families, in "auto" preference order. NVENC first even when the
+# monitors hang off another GPU: on this box it encodes 1440p at ~240 fps for
+# 0.08 of a core, against ~146 fps and 0.4 of a core through the AMD iGPU.
+ENCODERS = ("nvenc", "vaapi", "x264")
+
+
+def _va_h264_encoders() -> list[str]:
+    """VA-API H.264 encoder elements (AMD/Intel via Mesa or iHD). GStreamer
+    names them per DRM device: `vah264enc` for the first one, then
+    `varenderD129h264enc` etc., so the name moves if a VA device is added."""
+    names = (f.get_name() for f in
+             Gst.Registry.get().get_feature_list(Gst.ElementFactory))
+    return sorted(n for n in names
+                  if re.fullmatch(r"va(renderD\d+)?h264(lp)?enc", n))
+
+
+_ENCODER_ELEMENTS: dict[str, Callable[[], list[str]]] = {
+    "nvenc": lambda: ["nvh264enc"],
+    "vaapi": _va_h264_encoders,
+    "x264": lambda: ["x264enc"],
+}
+
+
+def _encoder_works(element: str) -> bool:
+    """Push a few test frames through the full encoder fragment, in a child
+    process. Being registered proves little: GStreamer's plugin cache can keep
+    nvh264enc after the card has gone (driver unloaded, GPU handed to a VM),
+    and a wedged driver can take its host process down with it."""
+    desc = (f"videotestsrc num-buffers=3 ! "
+            f"video/x-raw,format=BGRA,width=640,height=360,framerate=30/1 ! "
+            f"{_encoder_fragment(element, 2000)} ! fakesink")
+    try:
+        r = subprocess.run(["gst-launch-1.0", "-q", *desc.split()],
+                           capture_output=True, text=True, timeout=20)
+    except FileNotFoundError:
+        return True                  # no gst-launch to probe with: trust the registry
+    except subprocess.TimeoutExpired:
+        log.warning("encoder %s: probe timed out", element)
+        return False
+    if r.returncode != 0:
+        lines = (r.stderr or r.stdout).strip().splitlines()
+        log.warning("encoder %s: probe failed: %s", element,
+                    lines[-1] if lines else f"exit {r.returncode}")
+    return r.returncode == 0
+
+
+@functools.cache
+def select_encoder(pref: str = "auto") -> str:
+    """The H.264 encoder element to use: the first one of family `pref` (or of
+    NVENC -> VA-API -> x264 for "auto") that is installed AND encodes. "" if
+    none. Cached: probing costs a CUDA/VA init, and the GPUs present only
+    change across a reboot (which restarts the service anyway)."""
+    for family in (ENCODERS if pref == "auto" else (pref,)):
+        for element in _ENCODER_ELEMENTS[family]():
+            if Gst.ElementFactory.find(element) and _encoder_works(element):
+                return element
     return ""
 
 
@@ -127,11 +184,24 @@ def _even0(n: float) -> int:       # for crop offsets (>= 0)
 
 def _encoder_fragment(name: str, bitrate_kbps: int) -> str:
     # The capture arrives as BGRA. NVENC takes BGRA directly and converts on the
-    # GPU; the software encoders need a CPU conversion first (threaded: it's
-    # the single most expensive step on the CPU path).
+    # GPU; the others need a CPU conversion first (threaded: it's the single
+    # most expensive step on the CPU path).
     if name == "nvh264enc":
         return (f"nvh264enc name=enc bitrate={bitrate_kbps} gop-size=30 "
                 f"rc-mode=cbr preset=low-latency-hq zerolatency=true")
+    if name.startswith("va"):
+        # VA-API takes NV12 only. Converted on the CPU, not with vapostproc: on
+        # an iGPU that also composites the desktop (and renders KWin's
+        # screencast), vapostproc took ~25% of it at 1440p60, against ~0.4 of a
+        # core here. The queue runs conversion and encode on separate threads
+        # (101 -> 146 fps at 1440p on the Raphael iGPU). target-usage: Mesa's
+        # radeonsi doesn't follow the spec's 1 = quality .. 7 = speed scale;
+        # 2-3 measured fastest there (~141 fps vs ~72 for 4-7, the default),
+        # and since this encoder works a frame at a time, fastest = least lag.
+        return (f"videoconvert n-threads={_SW_THREADS} ! video/x-raw,format=NV12 ! "
+                f"queue max-size-buffers=1 ! "
+                f"{name} name=enc bitrate={bitrate_kbps} rate-control=cbr "
+                f"key-int-max=30 b-frames=0 target-usage=3")
     return (f"videoconvert n-threads={_SW_THREADS} ! "
             f"x264enc name=enc tune=zerolatency speed-preset=ultrafast "
             f"threads={_SW_THREADS} bitrate={bitrate_kbps} key-int-max=30")
@@ -145,9 +215,12 @@ def _video_chain(vmode: str, h264_enc: str, bitrate_kbps: int) -> tuple[str, str
                  Chromium-on-Linux/NVIDIA often have no usable H.264 in WebRTC.
       vp8      - VP8 (software encode). Decodes in EVERY browser; the universal
                  fallback for Linux browsers / NVIDIA boxes with no H.264 HW decode.
-      av1      - NVENC AV1 (needs nvav1enc + rtpav1pay AND a HW-AV1 client).
+      av1      - NVENC AV1 (needs nvav1enc + rtpav1pay AND a HW-AV1 client),
+                 only when NVENC is the H.264 encoder too: otherwise the card
+                 is missing/broken, or --encoder asked to leave it alone.
     Anything unavailable falls through to H.264 high."""
-    if (vmode == "av1" and Gst.ElementFactory.find("nvav1enc")
+    if (vmode == "av1" and h264_enc == "nvh264enc"
+            and Gst.ElementFactory.find("nvav1enc")
             and Gst.ElementFactory.find("rtpav1pay")):
         frag = (f"nvav1enc name=enc bitrate={bitrate_kbps} gop-size=30 rc-mode=cbr "
                 f"preset=p4 tune=ultra-low-latency ! "
@@ -179,7 +252,7 @@ def _video_chain(vmode: str, h264_enc: str, bitrate_kbps: int) -> tuple[str, str
 
 class MediaSession:
     def __init__(self, portal: Portal, *, send_cb: Callable[[dict], None],
-                 bitrate_kbps: int = 20000, force_software: bool = False,
+                 bitrate_kbps: int = 20000, encoder: str = "auto",
                  max_width: int = 2560, max_height: int = 1440,
                  monitor_index: int = 0, audio: bool = False, vmode: str = "high",
                  congestion_control: bool = False, injector=None,
@@ -203,9 +276,9 @@ class MediaSession:
         # never inject pointer/keyboard into the host.
         self.allow_input = allow_input
 
-        enc = "x264enc" if force_software else (encoder_available() or "x264enc")
-        if not Gst.ElementFactory.find(enc):
-            raise RuntimeError("no usable H.264 encoder (nvh264enc/x264enc)")
+        enc = select_encoder(encoder)
+        if not enc:
+            raise RuntimeError(f"no working H.264 encoder (--encoder {encoder})")
         self.encoder_name = enc
         self.video_chain, self.codec = _video_chain(vmode, enc, bitrate_kbps)
         if vmode in ("av1", "vp8") and self.codec != vmode:
@@ -257,7 +330,7 @@ class MediaSession:
         # frames for the encoder whenever the capture ran below 60.
         self.fps = 60
         # Encode size only. No format here: the BGRA capture goes into NVENC as
-        # is (it converts on the GPU); the software encoders add their own
+        # is (it converts on the GPU); the other encoders add their own
         # convert. Converting the whole 6088x1490 desktop on the CPU *before*
         # cropping, as this used to, capped the chain at ~33 fps on one core.
         sized = (f"video/x-raw,width={self.enc_w},height={self.enc_h},"

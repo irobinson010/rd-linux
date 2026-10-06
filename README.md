@@ -1,4 +1,4 @@
-# rd-linux — current-session Wayland remote desktop (WebRTC + NVENC)
+# rd-linux — current-session Wayland remote desktop (WebRTC + NVENC/VA-API)
 
 A self-hosted remote-desktop server for **KDE Plasma / Wayland** that lets you control
 your **existing logged-in session** from a browser. Unlike RDP/xrdp — which spin up a
@@ -6,7 +6,7 @@ your **existing logged-in session** from a browser. Unlike RDP/xrdp — which sp
 what's on the screen.
 
 Video is captured via the `xdg-desktop-portal` ScreenCast API, encoded on your GPU
-(**NVENC**, software x264 fallback), and streamed to a **browser over WebRTC**. Mouse
+(**NVENC** on NVIDIA, **VA-API** on AMD/Intel, software x264 fallback), and streamed to a **browser over WebRTC**. Mouse
 and keyboard travel back over a WebRTC data channel and are injected with a virtual
 **uinput** device. It works over a private overlay like **Twingate** with no public
 exposure.
@@ -14,7 +14,7 @@ exposure.
 ```
 Laptop/phone browser  ──(Twingate)──►  Your PC
   <video>/<audio> (WebRTC)              aiohttp  : serves the client + WebSocket signaling
-  input capture (JS)                    GStreamer: pipewiresrc → NVENC → webrtcbin
+  input capture (JS)                    GStreamer: pipewiresrc → NVENC/VA-API → webrtcbin
         │                               portal   : live-session screen capture
         └─ input over datachannel ──────► uinput : virtual keyboard + absolute pointer
 ```
@@ -31,7 +31,9 @@ and an **unattended mode** you can start over SSH.
 - **KDE Plasma on Wayland** (developed on Plasma 6 / Kubuntu). Needs
   `xdg-desktop-portal-kde`, PipeWire, WirePlumber — standard on Kubuntu.
 - Xwayland (standard) for the fullscreen-game window capture; `python3-xlib`.
-- **NVIDIA GPU with NVENC** recommended (software x264 works but is heavier).
+- A **hardware H.264 encoder**: NVIDIA (NVENC) or AMD/Intel (VA-API via Mesa,
+  installed with the desktop). Software x264 works but is heavier. The encoder need
+  not be on the GPU that drives your monitors — see `--encoder`.
 - A browser on the client (Chrome/Edge/Safari ideal; Firefox & Linux browsers work via
   the automatic VP8 fallback).
 - Optional: **Twingate** (or any VPN/overlay) for remote access without exposing ports.
@@ -178,7 +180,7 @@ What to expect:
   a software VP8 encode and audio together produced black frames on a VRR panel
   where each alone did not, so the service runs at a low CPU weight, the software
   encoders are limited to 4 threads, and 30 fps is a good gaming setting. Devices
-  that can decode H.264 cost almost nothing (NVENC); a viewer stuck on VP8 is the
+  that can decode H.264 cost almost nothing (hardware encode); a viewer stuck on VP8 is the
   expensive case -- clear the site's data on that browser once so it re-tests H.264.
 - Turn it off with `--game-capture off`. It needs `--unattended` (uinput input).
 
@@ -270,10 +272,21 @@ to `python3 -m rdserver` directly.
 | `--unattended` | uinput input + persistent capture (SSH-startable; see above) |
 | `--bitrate K` | initial video bitrate kbps (default 20000; also live in the toolbar) |
 | `--abr` | adaptive bitrate (WebRTC congestion control). **Off by default** — see note |
-| `--av1` | force NVENC AV1 for all clients (needs `install-av1.sh` + a HW-AV1 client) |
-| `--software` | force x264 software encoding instead of NVENC |
+| `--av1` | force NVENC AV1 for all clients (needs `install-av1.sh` + a HW-AV1 client, and NVENC as the encoder) |
+| `--encoder auto\|nvenc\|vaapi\|x264` | H.264 encoder (default auto, see note) |
+| `--software` | same as `--encoder x264` |
 | `--no-cursor` | don't embed the cursor in the video |
 | `-v` | verbose logging |
+
+> **`--encoder` note:** `auto` test-encodes a few frames at startup and takes the
+> first that works: NVENC, then VA-API (AMD/Intel), then x264. It doesn't matter
+> which GPU drives the monitors -- the capture reaches the server in system memory
+> either way -- so with displays on an AMD iGPU and an NVIDIA card still installed,
+> NVENC is used (on a Raphael iGPU + RTX 4080 box: ~240 vs ~146 fps encoding 1440p,
+> 0.08 vs 0.4 of a core). If the NVIDIA card is gone, unbound (e.g. passed to a VM)
+> or its driver is broken, the test encode fails and VA-API takes over. Force
+> `vaapi` to keep the NVIDIA card out of it entirely. The choice is logged at
+> startup (`encoder: ...`); restart the service after changing GPUs.
 
 > **`--abr` / audio note:** adaptive bitrate is off by default because driving the
 > encoder from the live bandwidth estimate churns the shared transport over tunneled
@@ -366,7 +379,8 @@ tests/run.sh            # the automatic tests
 python3 tests/test_vrr.py   # or run one standalone
 ```
 
-`test_webrtc_offer` needs GStreamer + an H.264 encoder; the auth/API and
+`test_webrtc_offer` needs GStreamer + an H.264 encoder (it checks every hardware
+encoder present); the auth/API and
 sd_notify tests need `python3-aiohttp`. Tests self-skip when a dependency is
 missing. `tests/test_uinput_mouse.py` is **manual** (it moves the real cursor)
 and isn't in the runner.
@@ -441,7 +455,7 @@ deploy/rd-tray.service  systemd --user unit for the tray indicator
 rdserver/
   __main__.py           entry point + CLI
   portal.py             ScreenCast / RemoteDesktop portal negotiation (+ persistence)
-  media.py              GStreamer webrtcbin pipeline (capture → NVENC → WebRTC) + dispatch
+  media.py              GStreamer webrtcbin pipeline (capture → NVENC/VA-API → WebRTC) + dispatch
   uinput_inject.py      virtual keyboard + absolute pointer (unattended input)
   signaling.py          aiohttp HTTP + WebSocket signaling, token auth, security headers
   sdnotify.py           systemd READY/WATCHDOG notifications (Type=notify unit)

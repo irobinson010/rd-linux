@@ -31,7 +31,7 @@ from gi.repository import Gst  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 from rdserver import sdnotify  # noqa: E402
-from rdserver.media import encoder_available  # noqa: E402
+from rdserver.media import ENCODERS, select_encoder  # noqa: E402
 from rdserver.portal import Portal  # noqa: E402
 from rdserver.signaling import ScrubAccessLogger, Server  # noqa: E402
 
@@ -124,8 +124,14 @@ def main() -> int:
     ap.add_argument("--av1", action="store_true",
                     help="use hardware AV1 (nvav1enc) instead of H.264 -- needs "
                          "the rtpav1pay plugin (install-av1.sh) and browser AV1 decode")
+    ap.add_argument("--encoder", choices=("auto",) + ENCODERS, default="auto",
+                    help="H.264 encoder. auto (default): NVENC if the NVIDIA "
+                         "card works, else VA-API (AMD/Intel GPU), else x264 "
+                         "software, regardless of which GPU drives the "
+                         "monitors. Name one to force it (and fail if it "
+                         "doesn't work)")
     ap.add_argument("--software", action="store_true",
-                    help="force x264 software encoding instead of NVENC")
+                    help="same as --encoder x264")
     ap.add_argument("--no-cursor", action="store_true",
                     help="do not embed the cursor in the video")
     ap.add_argument("--unattended", action="store_true",
@@ -155,12 +161,15 @@ def main() -> int:
         pass
 
     Gst.init(None)
-    enc = encoder_available()
+    if args.software:
+        args.encoder = "x264"
+    enc = select_encoder(args.encoder)
     if not enc:
-        print("ERROR: no H.264 encoder (nvh264enc/x264enc). Run install-deps.sh.")
+        print(f"ERROR: no working H.264 encoder (--encoder {args.encoder}). "
+              f"Run install.sh.")
         return 1
-    print(f"encoder available: {enc}"
-          + ("  (using x264 software, --software)" if args.software else ""))
+    print(f"encoder: {enc}"
+          + (f"  (forced, --encoder {args.encoder})" if args.encoder != "auto" else ""))
 
     # Token precedence: flag > environment > random. RD_TOKEN (set via the mode-600
     # rd.env the service loads) keeps the secret off the command line, where any
@@ -205,7 +214,7 @@ def main() -> int:
     base_url = f"{scheme}://{public_host}:{args.port}"
 
     server = Server(portal, token=token, bitrate_kbps=args.bitrate,
-                    force_software=args.software,
+                    encoder=args.encoder,
                     audio=args.audio, codec="av1" if args.av1 else "h264",
                     congestion_control=args.abr, injector=injector,
                     view_token=view_token, max_viewers=args.max_viewers,

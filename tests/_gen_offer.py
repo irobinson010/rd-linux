@@ -12,6 +12,7 @@ so that a regression of the PyGObject use-after-free shows up as a SIGSEGV exit.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import gi
@@ -21,19 +22,23 @@ gi.require_version("GstSdp", "1.0")
 gi.require_version("GstWebRTC", "1.0")
 from gi.repository import Gst, GstSdp, GstWebRTC, GLib  # noqa: E402,F401
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from rdserver.media import _encoder_fragment, select_encoder  # noqa: E402
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fps", type=int, default=60)
     ap.add_argument("--width", type=int, default=2560)
     ap.add_argument("--height", type=int, default=1440)
+    ap.add_argument("--encoder", default="auto")
     args = ap.parse_args()
 
     Gst.init(None)
-    enc = "nvh264enc" if Gst.ElementFactory.find("nvh264enc") else "x264enc"
-    encfrag = ("nvh264enc name=enc rc-mode=cbr zerolatency=true"
-               if enc == "nvh264enc"
-               else "x264enc name=enc tune=zerolatency speed-preset=ultrafast")
+    enc = select_encoder(args.encoder)
+    if not enc and args.encoder != "auto":
+        return 3                                 # that encoder family isn't here
+    encfrag = _encoder_fragment(enc or "x264enc", 8000)
 
     desc = (
         f"videotestsrc is-live=true ! videoconvert ! videoscale ! videorate ! "

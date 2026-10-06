@@ -106,7 +106,7 @@ async def security_headers(request: web.Request, handler):
 
 class Server:
     def __init__(self, portal: Portal, *, token: str, bitrate_kbps: int,
-                 force_software: bool, audio: bool = False,
+                 encoder: str = "auto", audio: bool = False,
                  codec: str = "h264", congestion_control: bool = False,
                  injector=None, view_token: str | None = None,
                  max_viewers: int = 4, view_ttl_s: int = 12 * 3600,
@@ -140,7 +140,7 @@ class Server:
         self.view_ttl_s = view_ttl_s
         self.max_viewers = max_viewers
         self.bitrate_kbps = bitrate_kbps
-        self.force_software = force_software
+        self.encoder = encoder
         self.audio = audio
         self.congestion_control = congestion_control
         self.injector = injector       # uinput injector (unattended) or None=portal
@@ -486,7 +486,7 @@ class Server:
             media = await loop.run_in_executor(self._media_executor, partial(
                 self._start_media,
                 send_cb=send_cb, bitrate_kbps=self.bitrate_kbps,
-                force_software=self.force_software, on_error=on_error,
+                encoder=self.encoder, on_error=on_error,
                 audio=self.audio, max_width=max_w, max_height=max_h,
                 monitor_index=monitor_index, vmode=vmode,
                 congestion_control=self.congestion_control,
